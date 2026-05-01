@@ -2907,8 +2907,13 @@ class FundAnalyzerPlugin(Star):
                     Path(__file__).parent / "templates" / "debate_report.html"
                 )
 
-            if template_path.exists():
-                # 渲染图片报告
+            summary = engine.format_debate_summary(debate_result)
+
+            if not template_path.exists():
+                yield event.plain_result(summary)
+            else:
+                # 渲染图片：本地 → 远程；均失败则文本摘要
+                rendered_image = False
                 if self.use_local_renderer:
                     try:
                         img_path = await render_fund_image(
@@ -2917,29 +2922,26 @@ class FundAnalyzerPlugin(Star):
                             width=520,
                         )
                         yield event.image_result(img_path)
+                        rendered_image = True
                     except Exception as e:
-                        logger.warning(f"本地渲染失败，回退到网络渲染: {e}")
+                        logger.warning(f"本地渲染失败，尝试远程渲染: {e}")
+
+                if not rendered_image:
+                    try:
                         with open(template_path, encoding="utf-8") as f:
                             template_str = f.read()
                         img_url = await self.image_renderer.render_custom_template(
-                            tmpl_str=template_str, tmpl_data=tmpl_data, return_url=True
+                            tmpl_str=template_str,
+                            tmpl_data=tmpl_data,
+                            return_url=True,
                         )
                         yield event.image_result(img_url)
-                else:
-                    with open(template_path, encoding="utf-8") as f:
-                        template_str = f.read()
-                    img_url = await self.image_renderer.render_custom_template(
-                        tmpl_str=template_str, tmpl_data=tmpl_data, return_url=True
-                    )
-                    yield event.image_result(img_url)
-            else:
-                # 降级到纯文本摘要
-                summary = engine.format_debate_summary(debate_result)
-                yield event.plain_result(summary)
+                        rendered_image = True
+                    except Exception as e:
+                        logger.warning(f"远程渲染失败，回退文本输出: {e}")
 
-            # 8. 发送简洁文字结论（纯文本，不含 markdown）
-            summary = engine.format_debate_summary(debate_result)
-            yield event.plain_result(summary)
+                # 出图成功时先发图，再发摘要；仅文本回退时也发同一份摘要
+                yield event.plain_result(summary)
 
         except ImportError:
             yield event.plain_result(
