@@ -2900,8 +2900,11 @@ class FundAnalyzerPlugin(Star):
                     Path(__file__).parent / "templates" / "debate_report.html"
                 )
 
+            debate_summary_plain = engine.format_debate_summary(debate_result)
+            debate_image_sent = False
             if template_path.exists():
-                # 渲染图片报告
+                with open(template_path, encoding="utf-8") as f:
+                    template_str = f.read()
                 if self.use_local_renderer:
                     try:
                         img_path = await render_fund_image(
@@ -2910,29 +2913,38 @@ class FundAnalyzerPlugin(Star):
                             width=520,
                         )
                         yield event.image_result(img_path)
+                        debate_image_sent = True
                     except Exception as e:
-                        logger.warning(f"本地渲染失败，回退到网络渲染: {e}")
-                        with open(template_path, encoding="utf-8") as f:
-                            template_str = f.read()
+                        logger.warning(f"博弈报告本地渲染失败，尝试网络渲染: {e}")
+                        try:
+                            img_url = await self.image_renderer.render_custom_template(
+                                tmpl_str=template_str,
+                                tmpl_data=tmpl_data,
+                                return_url=True,
+                            )
+                            yield event.image_result(img_url)
+                            debate_image_sent = True
+                        except Exception as e2:
+                            logger.warning(f"博弈报告网络渲染失败，降级文本: {e2}")
+                            yield event.plain_result(debate_summary_plain)
+                else:
+                    try:
                         img_url = await self.image_renderer.render_custom_template(
-                            tmpl_str=template_str, tmpl_data=tmpl_data, return_url=True
+                            tmpl_str=template_str,
+                            tmpl_data=tmpl_data,
+                            return_url=True,
                         )
                         yield event.image_result(img_url)
-                else:
-                    with open(template_path, encoding="utf-8") as f:
-                        template_str = f.read()
-                    img_url = await self.image_renderer.render_custom_template(
-                        tmpl_str=template_str, tmpl_data=tmpl_data, return_url=True
-                    )
-                    yield event.image_result(img_url)
+                        debate_image_sent = True
+                    except Exception as e:
+                        logger.warning(f"博弈报告网络渲染失败，降级文本: {e}")
+                        yield event.plain_result(debate_summary_plain)
             else:
-                # 降级到纯文本摘要
-                summary = engine.format_debate_summary(debate_result)
-                yield event.plain_result(summary)
+                yield event.plain_result(debate_summary_plain)
 
-            # 8. 发送简洁文字结论（纯文本，不含 markdown）
-            summary = engine.format_debate_summary(debate_result)
-            yield event.plain_result(summary)
+            # 8. 发送简洁文字结论（纯文本，不含 markdown）；图片已成功时附带一条摘要
+            if debate_image_sent:
+                yield event.plain_result(debate_summary_plain)
 
         except ImportError:
             yield event.plain_result(
