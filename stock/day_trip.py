@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import math
 import random
-import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -16,6 +15,7 @@ from typing import Any, Optional
 
 from astrbot.api import logger
 
+from .exchange_filter import a_share_price_limit_pct, should_exclude_a_share
 from ..quant_screening import (
     DEFAULT_SCREENING_CONCURRENCY,
     ScreeningRow,
@@ -43,18 +43,6 @@ def _normalize_screening_code(raw: str) -> str:
 def _is_b_share(code: str) -> bool:
     c = (code or "").zfill(6)
     return c.startswith("200") or c.startswith("900")
-
-
-def _limit_ratio_pct(code: str, name: str) -> float:
-    n = name or ""
-    if re.search(r"ST", n, re.I):
-        return 5.0
-    c = (code or "").zfill(6)
-    if c.startswith("688"):
-        return 20.0
-    if c.startswith("30") or c.startswith("301"):
-        return 20.0
-    return 10.0
 
 
 def _find_col(df: Any, candidates: tuple[str, ...]) -> Optional[str]:
@@ -90,10 +78,12 @@ def filter_spot_for_day_trip(
     pct_low: float = 3.0,
     pct_high: float = 9.0,
     min_volume_ratio: float = 1.5,
+    exclude_bse: bool = False,
+    exclude_chinext: bool = False,
 ) -> tuple[list[tuple[str, str]], dict[str, dict[str, float]], bool]:
     """
     从 A 股快照表筛选：涨跌幅 [pct_low, pct_high]、量比 > min_volume_ratio；
-    剔除停牌（无量）、B 股。
+    剔除停牌（无量）、B 股；可选剔除北交所/创业板（见 exclude_bse / exclude_chinext）。
 
     若无「量比」列但有「成交量」，则用全样本成交量中位数自建近似量比（第三项返回 True）。
 
@@ -161,6 +151,10 @@ def filter_spot_for_day_trip(
     for _, row in dd.iterrows():
         c = _normalize_screening_code(str(row.get(code_col, "")))
         if not c or _is_b_share(c):
+            continue
+        if should_exclude_a_share(
+            c, exclude_bse=exclude_bse, exclude_chinext=exclude_chinext
+        ):
             continue
         nm = str(row[name_col]) if name_col in dd.columns else ""
         pairs.append((c, nm))
@@ -312,7 +306,7 @@ def evaluate_intraday_minutes(
         float(np.max(m["high"])),
         last_close,
         prev_close,
-        _limit_ratio_pct(code, name),
+        a_share_price_limit_pct(code, name),
     )
 
     out["passed"] = True

@@ -15,6 +15,7 @@ from typing import Any, Optional
 from astrbot.api import logger
 
 from .ai_analyzer.quant import QuantAnalyzer
+from .stock.exchange_filter import is_likely_limit_up, should_exclude_a_share
 
 MIN_HISTORY_BARS = 20
 HISTORY_DAYS = 60
@@ -186,7 +187,14 @@ async def screen_lof_funds(
     return rows, attempted
 
 
-def _pandas_abs_change_pairs(df: Any, max_scan: int) -> list[tuple[str, str]]:
+def _pandas_abs_change_pairs(
+    df: Any,
+    max_scan: int,
+    *,
+    exclude_bse: bool = False,
+    exclude_chinext: bool = False,
+    exclude_limit_up: bool = False,
+) -> list[tuple[str, str]]:
     import pandas as pd
 
     rate_col = "涨跌幅"
@@ -213,11 +221,22 @@ def _pandas_abs_change_pairs(df: Any, max_scan: int) -> list[tuple[str, str]]:
     dd = dd.sort_values("_abs", ascending=False)
 
     pairs: list[tuple[str, str]] = []
-    for _, row in dd.head(max_scan).iterrows():
+    for _, row in dd.iterrows():
+        if len(pairs) >= max_scan:
+            break
         c = _normalize_screening_code(row.get(code_col, ""))
         if not c:
             continue
+        if should_exclude_a_share(
+            c, exclude_bse=exclude_bse, exclude_chinext=exclude_chinext
+        ):
+            continue
         nm = str(row[name_col]) if name_col in dd.columns else ""
+        if exclude_limit_up:
+            raw_pct = pd.to_numeric(row.get(rate_col), errors="coerce")
+            pct_f = 0.0 if pd.isna(raw_pct) else float(raw_pct)
+            if is_likely_limit_up(pct_f, c, nm):
+                continue
         pairs.append((c, nm))
     return pairs
 
@@ -228,11 +247,20 @@ async def screen_stocks_by_abs_pct(
     *,
     max_scan: int = 150,
     max_concurrent: int = DEFAULT_SCREENING_CONCURRENCY,
+    exclude_bse: bool = False,
+    exclude_chinext: bool = False,
+    exclude_limit_up: bool = False,
 ) -> tuple[list[ScreeningRow], int]:
     df = await stock_analyzer._get_stock_data()
     if df is None or len(df) == 0:
         return [], 0
-    pairs = _pandas_abs_change_pairs(df, max_scan)
+    pairs = _pandas_abs_change_pairs(
+        df,
+        max_scan,
+        exclude_bse=exclude_bse,
+        exclude_chinext=exclude_chinext,
+        exclude_limit_up=exclude_limit_up,
+    )
     attempted = len(pairs)
     if not pairs:
         return [], 0

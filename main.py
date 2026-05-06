@@ -37,8 +37,10 @@ from .stock.board_ak import (
 from .command_parse import (
     DEFAULT_BOARD_DISPLAY_LIMIT,
     get_event_plain_text,
+    parse_day_trip_tail,
     parse_keyword_and_limit,
     parse_name_maxscan_top,
+    parse_quant_stock_screen_tail,
     strip_command_prefix,
 )
 
@@ -2192,22 +2194,31 @@ class FundAnalyzerPlugin(Star):
     ):
         """
         从 A 股全市场行情中按 |涨跌幅| 取前 N 只，逐只拉日线并量化排序。
-        用法: 量化精选股票 [候选只数] [输出条数]
-        默认: 候选150只，输出10条。
+        用法: 量化精选股票 [候选只数] [输出条数] [去北交所] [去创业板] [去涨停/剔涨停/剔除涨停]
+        关键词可与数字任意顺序；默认候选150只、输出10条；不写关键词则全市场；去涨停类默认不写则不剔除。
         """
         try:
-            if not max_scan_arg.strip():
-                max_scan = 150
-                top_n = parse_optional_positive_int(10, top_arg) or 10
-            elif not top_arg.strip():
-                max_scan = parse_optional_positive_int(150, max_scan_arg) or 150
-                top_n = 10
-            else:
-                max_scan = parse_optional_positive_int(150, max_scan_arg) or 150
-                top_n = parse_optional_positive_int(10, top_arg) or 10
+            tail = strip_command_prefix(
+                get_event_plain_text(event), "量化精选股票"
+            )
+            max_scan, top_n, exclude_bse, exclude_chinext, exclude_limit_up = (
+                parse_quant_stock_screen_tail(tail)
+            )
+            ex_notes: list[str] = []
+            if exclude_bse:
+                ex_notes.append("北交所")
+            if exclude_chinext:
+                ex_notes.append("创业板")
+            if exclude_limit_up:
+                ex_notes.append("涨停股")
+            ex_suffix = (
+                "，剔除：" + "、".join(ex_notes)
+                if ex_notes
+                else "（全市场）"
+            )
 
             yield event.plain_result(
-                f"📊 量化精选股票：按 |涨跌幅| 取前 {max_scan} 只拉取60日K线，"
+                f"📊 量化精选股票{ex_suffix}：按 |涨跌幅| 取前 {max_scan} 只拉取60日K线，"
                 f"输出 TOP {top_n}（约需数分钟）..."
             )
 
@@ -2216,6 +2227,9 @@ class FundAnalyzerPlugin(Star):
                 self.analyzer,
                 max_scan=max_scan,
                 max_concurrent=DEFAULT_SCREENING_CONCURRENCY,
+                exclude_bse=exclude_bse,
+                exclude_chinext=exclude_chinext,
+                exclude_limit_up=exclude_limit_up,
             )
             if attempted == 0:
                 yield event.plain_result(
@@ -2253,21 +2267,36 @@ class FundAnalyzerPlugin(Star):
     async def stock_day_trip(self, event: AstrMessageEvent, top_arg: str = ""):
         """
         涨跌幅 3%~9% 且量比>1.5（无量比列时用成交量自建近似）→ 日线综合分前 20% → 分时 VWAP/尾盘急拉/触板回落。
-        用法: 股票一日游 [展示条数]，默认 15，最大 50。
+        用法: 股票一日游 [展示条数] [去北交所] [去创业板]，默认展示 15（最大50）；不写关键词则全市场。
         """
         try:
-            top_n = parse_optional_positive_int(15, top_arg) or 15
-            top_n = max(1, min(50, top_n))
+            tail = strip_command_prefix(get_event_plain_text(event), "股票一日游")
+            top_n, exclude_bse, exclude_chinext = parse_day_trip_tail(tail)
+            ex_notes: list[str] = []
+            if exclude_bse:
+                ex_notes.append("北交所")
+            if exclude_chinext:
+                ex_notes.append("创业板")
+            ex_suffix = (
+                "，剔除：" + "、".join(ex_notes)
+                if ex_notes
+                else "（全市场）"
+            )
 
             yield event.plain_result(
-                "📊 股票一日游：快照硬筛（涨跌幅 3%~9%、量比>1.5；无量比列时用成交量自建近似）"
+                f"📊 股票一日游{ex_suffix}：快照硬筛（涨跌幅 3%~9%、量比>1.5；"
+                "无量比列时用成交量自建近似）"
                 "→ 日线综合分前 20% → 分时验证…\n"
                 "⏳ 正在获取全市场 A 股行情…"
             )
 
             df = await self.stock_analyzer._get_stock_data()
 
-            pairs, meta, vr_approx = filter_spot_for_day_trip(df)
+            pairs, meta, vr_approx = filter_spot_for_day_trip(
+                df,
+                exclude_bse=exclude_bse,
+                exclude_chinext=exclude_chinext,
+            )
             if not pairs:
                 approx_hint = ""
                 if vr_approx:
@@ -3120,8 +3149,8 @@ class FundAnalyzerPlugin(Star):
 🔹 基金分析 [代码] - 技术分析(均线/趋势)
 🔹 基金对比 [代码1] [代码2] - ⚖️对比两只基金
 🔹 量化精选基金 [分析上限] [输出条数] - 场内 LOF 列表批量量化排序（默认单页/top10，非投资建议）
-🔹 量化精选股票 [候选数] [输出条数] - |涨跌幅|前筛+排序（默认150/10，依赖 akshare）
-🔹 股票一日游 [展示条数] - 3%~9%且量比>1.5→综合分前20%→分时；无量比列时用成交量自建近似（报告内会说明）
+🔹 量化精选股票 [候选数] [输出条数] [去北交所] [去创业板] [去涨停/剔涨停/剔除涨停] - |涨跌幅|前筛+排序（默认150/10）；关键词可与数字任意顺序，不写则全市场；剔除涨停默认关闭
+🔹 股票一日游 [展示条数] [去北交所] [去创业板] - 同上关键词；默认展示15最大50；3%~9%且量比>1.5→综合分前20%→分时（报告内说明量比近似）
 💡 东财快照含原生量比；新浪源多为自建近似。分时依赖当日分钟 K。
 💡 量化精选结果优先以图片呈现（首选本地渲染，不可用则尝试网络渲染；均失败时为文本表格）。
 💡 并发拉多档 K 线时若频繁断连，多为数据源限流或网络原因，可稍后重试或减少分析数量。
@@ -3153,7 +3182,9 @@ class FundAnalyzerPlugin(Star):
   • 基金分析
   • 基金对比 161226 513100
   • 量化精选股票 150 10
-  • 股票一日游 15
+  • 量化精选股票 去北交所 去创业板 150 10
+  • 量化精选股票 去涨停 150 10
+  • 股票一日游 15 去创业板
   • 量化精选基金 400 10
   • 智能分析 161226
   • 股票智能分析 161226
