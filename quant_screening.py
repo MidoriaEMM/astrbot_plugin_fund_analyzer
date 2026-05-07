@@ -193,6 +193,7 @@ def _pandas_abs_change_pairs(
     *,
     exclude_bse: bool = False,
     exclude_chinext: bool = False,
+    exclude_star: bool = False,
     exclude_limit_up: bool = False,
 ) -> list[tuple[str, str]]:
     import pandas as pd
@@ -228,7 +229,10 @@ def _pandas_abs_change_pairs(
         if not c:
             continue
         if should_exclude_a_share(
-            c, exclude_bse=exclude_bse, exclude_chinext=exclude_chinext
+            c,
+            exclude_bse=exclude_bse,
+            exclude_chinext=exclude_chinext,
+            exclude_star=exclude_star,
         ):
             continue
         nm = str(row[name_col]) if name_col in dd.columns else ""
@@ -249,6 +253,7 @@ async def screen_stocks_by_abs_pct(
     max_concurrent: int = DEFAULT_SCREENING_CONCURRENCY,
     exclude_bse: bool = False,
     exclude_chinext: bool = False,
+    exclude_star: bool = False,
     exclude_limit_up: bool = False,
 ) -> tuple[list[ScreeningRow], int]:
     df = await stock_analyzer._get_stock_data()
@@ -259,6 +264,7 @@ async def screen_stocks_by_abs_pct(
         max_scan,
         exclude_bse=exclude_bse,
         exclude_chinext=exclude_chinext,
+        exclude_star=exclude_star,
         exclude_limit_up=exclude_limit_up,
     )
     attempted = len(pairs)

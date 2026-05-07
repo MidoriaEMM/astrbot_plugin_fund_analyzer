@@ -1,5 +1,5 @@
 """
-A 股代码与交易所/板块：北交所、创业板前缀判断（东财快照无单独市场列时用代码归纳）。
+A 股代码与交易所/板块：北交所、创业板、科创板前缀判断（东财快照无单独市场列时用代码归纳）。
 """
 
 from __future__ import annotations
@@ -24,6 +24,12 @@ def is_chinext_code(code: str) -> bool:
     return c.startswith("300") or c.startswith("301")
 
 
+def is_star_market_code(code: str) -> bool:
+    """科创板常见号段：688、689。"""
+    c = (code or "").zfill(6)
+    return c.startswith("688") or c.startswith("689")
+
+
 def is_beijing_exchange_code(code: str) -> bool:
     """北交所常见号段：43/83/87/88 及 920 等（92xxxx）。"""
     c = (code or "").zfill(6)
@@ -31,7 +37,11 @@ def is_beijing_exchange_code(code: str) -> bool:
 
 
 def should_exclude_a_share(
-    code: str, *, exclude_bse: bool, exclude_chinext: bool
+    code: str,
+    *,
+    exclude_bse: bool,
+    exclude_chinext: bool,
+    exclude_star: bool = False,
 ) -> bool:
     """是否按用户选项剔除该行（须在规范化后的 6 位代码上调用，也可传入含数字的原始串）。"""
     c = normalize_screening_code(code) if code else ""
@@ -40,6 +50,8 @@ def should_exclude_a_share(
     if exclude_chinext and is_chinext_code(c):
         return True
     if exclude_bse and is_beijing_exchange_code(c):
+        return True
+    if exclude_star and is_star_market_code(c):
         return True
     return False
 

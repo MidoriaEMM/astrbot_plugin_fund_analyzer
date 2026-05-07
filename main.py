@@ -36,10 +36,12 @@ from .stock.board_ak import (
 
 from .command_parse import (
     DEFAULT_BOARD_DISPLAY_LIMIT,
+    MAX_QUANT_STOCK_DEBATE_CAP,
     get_event_plain_text,
     parse_day_trip_tail,
     parse_keyword_and_limit,
     parse_name_maxscan_top,
+    parse_quant_stock_screen_debate_tail,
     parse_quant_stock_screen_tail,
     strip_command_prefix,
 )
@@ -2194,14 +2196,14 @@ class FundAnalyzerPlugin(Star):
     ):
         """
         从 A 股全市场行情中按 |涨跌幅| 取前 N 只，逐只拉日线并量化排序。
-        用法: 量化精选股票 [候选只数] [输出条数] [去北交所] [去创业板] [去涨停/剔涨停/剔除涨停]
-        关键词可与数字任意顺序；默认候选150只、输出10条；不写关键词则全市场；去涨停类默认不写则不剔除。
+        用法: 量化精选股票 [候选只数] [输出条数] [去北交所] [去创业板] [去科技/去科创板/去科创] [去涨停/剔涨停/剔除涨停]
+        关键词可与数字任意顺序；默认候选150只、输出10条；不写关键词则全市场；不写「去科技」则含科创板；去涨停类默认不写则不剔除。
         """
         try:
             tail = strip_command_prefix(
                 get_event_plain_text(event), "量化精选股票"
             )
-            max_scan, top_n, exclude_bse, exclude_chinext, exclude_limit_up = (
+            max_scan, top_n, exclude_bse, exclude_chinext, exclude_limit_up, exclude_star = (
                 parse_quant_stock_screen_tail(tail)
             )
             ex_notes: list[str] = []
@@ -2209,6 +2211,8 @@ class FundAnalyzerPlugin(Star):
                 ex_notes.append("北交所")
             if exclude_chinext:
                 ex_notes.append("创业板")
+            if exclude_star:
+                ex_notes.append("科创板")
             if exclude_limit_up:
                 ex_notes.append("涨停股")
             ex_suffix = (
@@ -2229,6 +2233,7 @@ class FundAnalyzerPlugin(Star):
                 max_concurrent=DEFAULT_SCREENING_CONCURRENCY,
                 exclude_bse=exclude_bse,
                 exclude_chinext=exclude_chinext,
+                exclude_star=exclude_star,
                 exclude_limit_up=exclude_limit_up,
             )
             if attempted == 0:
@@ -2263,20 +2268,138 @@ class FundAnalyzerPlugin(Star):
             logger.error(f"量化精选股票出错: {e}")
             yield event.plain_result(f"❌ 执行失败: {e}")
 
-    @filter.command("股票一日游")
-    async def stock_day_trip(self, event: AstrMessageEvent, top_arg: str = ""):
+    @filter.command("量化精选股票多空")
+    async def quant_screen_stocks_debate_plain(self, event: AstrMessageEvent):
         """
-        涨跌幅 3%~9% 且量比>1.5（无量比列时用成交量自建近似）→ 日线综合分前 20% → 分时 VWAP/尾盘急拉/触板回落。
-        用法: 股票一日游 [展示条数] [去北交所] [去创业板]，默认展示 15（最大50）；不写关键词则全市场。
+        与「量化精选股票」相同筛股排序后，对前若干只依次执行「股票智能分析」，仅输出纯文本多空结论。
+        用法: 量化精选股票多空 [候选只数] [输出条数] [智能分析只数上限] [去北交所] …（第三个数字可选）
+        智能分析只数为 min(第三个数字, 输出条数, 全局上限)；未写第三个数字时为 min(输出条数, 全局上限)。剔除关键词与「量化精选股票」相同。
         """
         try:
-            tail = strip_command_prefix(get_event_plain_text(event), "股票一日游")
-            top_n, exclude_bse, exclude_chinext = parse_day_trip_tail(tail)
+            if not self.context.get_using_provider():
+                yield event.plain_result(
+                    "❌ 未配置大模型提供商\n"
+                    "💡 请在 AstrBot 管理面板配置 LLM 提供商后再试"
+                )
+                return
+
+            tail = strip_command_prefix(
+                get_event_plain_text(event), "量化精选股票多空"
+            )
+            (
+                max_scan,
+                top_n,
+                debate_cap,
+                exclude_bse,
+                exclude_chinext,
+                exclude_limit_up,
+                exclude_star,
+            ) = parse_quant_stock_screen_debate_tail(tail)
+
             ex_notes: list[str] = []
             if exclude_bse:
                 ex_notes.append("北交所")
             if exclude_chinext:
                 ex_notes.append("创业板")
+            if exclude_star:
+                ex_notes.append("科创板")
+            if exclude_limit_up:
+                ex_notes.append("涨停股")
+            ex_suffix = (
+                "，剔除：" + "、".join(ex_notes)
+                if ex_notes
+                else "（全市场）"
+            )
+
+            yield event.plain_result(
+                f"⚖️ 量化精选股票多空{ex_suffix}：候选至多 {max_scan} 只 → TOP {top_n} → "
+                f"依次智能分析前 {debate_cap} 只（每只约 9 次 LLM，约 3～5 分钟；单指令上限 "
+                f"{MAX_QUANT_STOCK_DEBATE_CAP} 只）。\n"
+                "下面每条形如：代码 名称 看涨/看跌/中性"
+            )
+
+            raw, attempted = await screen_stocks_by_abs_pct(
+                self.stock_analyzer,
+                self.analyzer,
+                max_scan=max_scan,
+                max_concurrent=DEFAULT_SCREENING_CONCURRENCY,
+                exclude_bse=exclude_bse,
+                exclude_chinext=exclude_chinext,
+                exclude_star=exclude_star,
+                exclude_limit_up=exclude_limit_up,
+            )
+            if attempted == 0:
+                yield event.plain_result(
+                    "⚠️ 未得到行情候选（需 akshare 或涨跌幅/代码列缺失），"
+                    "请检查网络或缩小 max_scan。"
+                )
+                return
+            ranked = rank_screening_rows(raw)
+            top_rows = ranked[:top_n]
+
+            if not raw:
+                yield event.plain_result(
+                    f"⚠️ 已对 {attempted} 只拉取日线，均无足够 K 线样本（<{MIN_HISTORY_BARS} 根），无法排序。"
+                    + DISCLAIMER
+                )
+                return
+
+            targets = top_rows[:debate_cap]
+            if not targets:
+                yield event.plain_result(
+                    "⚠️ 排序结果为空，无法做多智能体分析。" + DISCLAIMER
+                )
+                return
+
+            ok_n = 0
+            fail_n = 0
+            dir_ok = frozenset({"看涨", "看跌", "中性"})
+            for row in targets:
+                debate_result, _info, err = await self._run_debate_pipeline_for_code(
+                    row.code,
+                    False,
+                    progress_callback=None,
+                )
+                if err:
+                    fail_n += 1
+                    short = (err.strip().split("\n") or [err])[0].strip()
+                    yield event.plain_result(f"{row.code} {row.name} 失败：{short}")
+                else:
+                    ok_n += 1
+                    d = debate_result.final_direction
+                    label = d if d in dir_ok else "中性"
+                    yield event.plain_result(f"{row.code} {row.name} {label}")
+
+            yield event.plain_result(
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"完成：成功 {ok_n} 条，失败 {fail_n} 条。\n"
+                f"{DISCLAIMER.strip()}"
+            )
+
+        except ImportError:
+            yield event.plain_result(
+                "❌ 需要 akshare 拉取 A 股行情\n请执行: pip install akshare"
+            )
+        except Exception as e:
+            logger.error(f"量化精选股票多空出错: {e}")
+            yield event.plain_result(f"❌ 执行失败: {e}")
+
+    @filter.command("股票一日游")
+    async def stock_day_trip(self, event: AstrMessageEvent, top_arg: str = ""):
+        """
+        涨跌幅 3%~9% 且量比>1.5（无量比列时用成交量自建近似）→ 日线综合分前 20% → 分时 VWAP/尾盘急拉/触板回落。
+        用法: 股票一日游 [展示条数] [去北交所] [去创业板] [去科技/去科创板/去科创]，默认展示 15（最大50）；不写关键词则全市场。
+        """
+        try:
+            tail = strip_command_prefix(get_event_plain_text(event), "股票一日游")
+            top_n, exclude_bse, exclude_chinext, exclude_star = parse_day_trip_tail(tail)
+            ex_notes: list[str] = []
+            if exclude_bse:
+                ex_notes.append("北交所")
+            if exclude_chinext:
+                ex_notes.append("创业板")
+            if exclude_star:
+                ex_notes.append("科创板")
             ex_suffix = (
                 "，剔除：" + "、".join(ex_notes)
                 if ex_notes
@@ -2296,6 +2419,7 @@ class FundAnalyzerPlugin(Star):
                 df,
                 exclude_bse=exclude_bse,
                 exclude_chinext=exclude_chinext,
+                exclude_star=exclude_star,
             )
             if not pairs:
                 approx_hint = ""
@@ -2587,6 +2711,91 @@ class FundAnalyzerPlugin(Star):
     # ============================================================
     # 多智能体博弈分析指令
     # ============================================================
+    async def _run_debate_pipeline_for_code(
+        self,
+        fund_code: str,
+        prefer_otc: bool,
+        *,
+        normalized_explicit_code: Optional[str] = None,
+        progress_callback: Any = None,
+    ) -> tuple[Any, Any, Optional[str]]:
+        """
+        拉取行情与资讯并执行 DebateEngine.run_debate。
+        成功返回 (DebateResult, FundInfo, None)，失败返回 (None, None, 面向用户的错误文案)。
+        """
+        from .stock.debate_engine import DebateEngine
+
+        info = await self.analyzer.get_lof_realtime(
+            fund_code, prefer_otc=prefer_otc
+        )
+        if not info:
+            if (
+                normalized_explicit_code
+                and len(normalized_explicit_code) == 6
+                and normalized_explicit_code.isdigit()
+            ):
+                try:
+                    search_res = await self.analyzer.search_fund(
+                        normalized_explicit_code
+                    )
+                    if not search_res:
+                        return None, None, (
+                            f"❌ 未找到基金代码 {fund_code}\n"
+                            "💡 请检查代码是否正确，或使用「搜索基金 关键词」查找"
+                        )
+                except Exception:
+                    pass
+            return None, None, (
+                f"⚠️ 暂时无法获取基金 {fund_code} 的数据\n"
+                "💡 可能是数据源暂时不可用，请稍后重试"
+            )
+
+        provider = self.context.get_using_provider()
+        if not provider:
+            return None, None, (
+                "❌ 未配置大模型提供商\n"
+                "💡 请在 AstrBot 管理面板配置 LLM 提供商后再试"
+            )
+
+        history_task = self.analyzer.get_lof_history(
+            fund_code, days=60, prefer_otc=prefer_otc
+        )
+        flow_task = self.analyzer._api.get_fund_flow(
+            fund_code, days=0, prefer_otc=prefer_otc
+        )
+
+        history_data = await history_task
+        fund_flow_data = []
+        try:
+            fund_flow_data = await flow_task
+        except Exception as e:
+            logger.debug(f"获取资金流向失败: {e}")
+
+        if not history_data or len(history_data) < 10:
+            return None, None, (
+                f"⚠️ 基金 {fund_code} 历史数据不足，无法进行深度分析"
+            )
+
+        news_summary = await self.ai_analyzer.get_news_summary(info.name, info.code)
+        factors_text = self.ai_analyzer.factors.format_factors_text(info.name)
+        global_situation_text = (
+            self.ai_analyzer.factors.format_global_situation_text(info.name)
+        )
+
+        engine = DebateEngine(self.context)
+        debate_result = await engine.run_debate(
+            fund_info=info,
+            history_data=history_data,
+            fund_flow_data=fund_flow_data,
+            news_summary=news_summary,
+            factors_text=factors_text,
+            global_situation_text=global_situation_text,
+            quant_analyzer=self.ai_analyzer.quant,
+            eastmoney_api=self.analyzer._api,
+            progress_callback=progress_callback,
+        )
+        return debate_result, info, None
+
     @filter.command("股票智能分析")
     async def multi_agent_debate(self, event: AstrMessageEvent, code: str = ""):
         """
@@ -2606,93 +2815,24 @@ class FundAnalyzerPlugin(Star):
                 "📡 正在采集数据，预计需要 3-5 分钟..."
             )
 
-            # 1. 获取基金基本信息
-            info = await self.analyzer.get_lof_realtime(
-                fund_code, prefer_otc=prefer_otc
-            )
-            if not info:
-                if (
-                    normalized_code
-                    and len(normalized_code) == 6
-                    and normalized_code.isdigit()
-                ):
-                    try:
-                        search_res = await self.analyzer.search_fund(normalized_code)
-                        if not search_res:
-                            yield event.plain_result(
-                                f"❌ 未找到基金代码 {fund_code}\n"
-                                "💡 请检查代码是否正确，或使用「搜索基金 关键词」查找"
-                            )
-                            return
-                    except Exception:
-                        pass
-                yield event.plain_result(
-                    f"⚠️ 暂时无法获取基金 {fund_code} 的数据\n"
-                    "💡 可能是数据源暂时不可用，请稍后重试"
-                )
-                return
-
-            # 2. 检查大模型是否可用
-            provider = self.context.get_using_provider()
-            if not provider:
-                yield event.plain_result(
-                    "❌ 未配置大模型提供商\n"
-                    "💡 请在 AstrBot 管理面板配置 LLM 提供商后再试"
-                )
-                return
-
-            # 3. 获取历史数据和资金流向
-            history_task = self.analyzer.get_lof_history(
-                fund_code, days=60, prefer_otc=prefer_otc
-            )
-            flow_task = self.analyzer._api.get_fund_flow(
-                fund_code, days=0, prefer_otc=prefer_otc
-            )
-
-            history_data = await history_task
-            fund_flow_data = []
-            try:
-                fund_flow_data = await flow_task
-            except Exception as e:
-                logger.debug(f"获取资金流向失败: {e}")
-
-            if not history_data or len(history_data) < 10:
-                yield event.plain_result(
-                    f"⚠️ 基金 {fund_code} 历史数据不足，无法进行深度分析"
-                )
-                return
-
-            # 4. 获取新闻摘要和影响因素
-            # yield event.plain_result("📰 正在获取市场资讯和影响因素...")
-
-            news_summary = await self.ai_analyzer.get_news_summary(info.name, info.code)
-            factors_text = self.ai_analyzer.factors.format_factors_text(info.name)
-            global_situation_text = (
-                self.ai_analyzer.factors.format_global_situation_text(info.name)
-            )
-
-            # 5. 创建辩论引擎并执行
-            from .stock.debate_engine import DebateEngine
-
-            engine = DebateEngine(self.context)
-
-            # 进度回调：通过 yield 发送进度消息
-            progress_messages = []
+            progress_messages: list[str] = []
 
             async def on_progress(msg: str):
                 progress_messages.append(msg)
 
-            debate_result = await engine.run_debate(
-                fund_info=info,
-                history_data=history_data,
-                fund_flow_data=fund_flow_data,
-                news_summary=news_summary,
-                factors_text=factors_text,
-                global_situation_text=global_situation_text,
-                quant_analyzer=self.ai_analyzer.quant,
-                eastmoney_api=self.analyzer._api,
+            debate_result, info, err = await self._run_debate_pipeline_for_code(
+                fund_code,
+                prefer_otc,
+                normalized_explicit_code=normalized_code,
                 progress_callback=on_progress,
             )
+            if err:
+                yield event.plain_result(err)
+                return
+
+            from .stock.debate_engine import DebateEngine
+
+            engine = DebateEngine(self.context)
 
             # 6. 发送进度汇总
             if progress_messages:
@@ -3149,8 +3289,9 @@ class FundAnalyzerPlugin(Star):
 🔹 基金分析 [代码] - 技术分析(均线/趋势)
 🔹 基金对比 [代码1] [代码2] - ⚖️对比两只基金
 🔹 量化精选基金 [分析上限] [输出条数] - 场内 LOF 列表批量量化排序（默认单页/top10，非投资建议）
-🔹 量化精选股票 [候选数] [输出条数] [去北交所] [去创业板] [去涨停/剔涨停/剔除涨停] - |涨跌幅|前筛+排序（默认150/10）；关键词可与数字任意顺序，不写则全市场；剔除涨停默认关闭
-🔹 股票一日游 [展示条数] [去北交所] [去创业板] - 同上关键词；默认展示15最大50；3%~9%且量比>1.5→综合分前20%→分时（报告内说明量比近似）
+🔹 量化精选股票 [候选数] [输出条数] [去北交所] [去创业板] [去科技/去科创板/去科创] [去涨停/剔涨停/剔除涨停] - |涨跌幅|前筛+排序（默认150/10）；关键词可与数字任意顺序，不写则全市场；不写「去科技」则含科创板；剔除涨停默认关闭
+🔹 量化精选股票多空 [候选数] [输出条数] [智能分析上限] … - 同上筛选与剔除；第三数字可选，限制「股票智能分析」只数（默认不超过输出条数且单指令至多15只）；依次输出「代码 名称 看涨/看跌/中性」纯文本
+🔹 股票一日游 [展示条数] [去北交所] [去创业板] [去科技/去科创板/去科创] - 同上关键词；默认展示15最大50；3%~9%且量比>1.5→综合分前20%→分时（报告内说明量比近似）
 💡 东财快照含原生量比；新浪源多为自建近似。分时依赖当日分钟 K。
 💡 量化精选结果优先以图片呈现（首选本地渲染，不可用则尝试网络渲染；均失败时为文本表格）。
 💡 并发拉多档 K 线时若频繁断连，多为数据源限流或网络原因，可稍后重试或减少分析数量。
@@ -3183,7 +3324,10 @@ class FundAnalyzerPlugin(Star):
   • 基金对比 161226 513100
   • 量化精选股票 150 10
   • 量化精选股票 去北交所 去创业板 150 10
+  • 量化精选股票 去科技 150 10
   • 量化精选股票 去涨停 150 10
+  • 量化精选股票多空 150 10 3
+  • 量化精选股票多空 去创业板 150 10
   • 股票一日游 15 去创业板
   • 量化精选基金 400 10
   • 智能分析 161226

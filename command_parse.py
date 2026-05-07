@@ -19,14 +19,17 @@ MAX_BOARD_QUANT_MAX_SCAN = 200
 MIN_BOARD_QUANT_TOP = 1
 MAX_BOARD_QUANT_TOP = 50
 
-# 量化精选股票 / 股票一日游：剔除北交所、创业板的关键词（可与数字任意混排）
+# 量化精选股票 / 股票一日游：剔除北交所、创业板、科创板的关键词（可与数字任意混排）
 EXCLUDE_BEIJING_KEYWORDS = frozenset({"去北交所", "去北交"})
 EXCLUDE_CHINEXT_KEYWORDS = frozenset({"去创业板", "去创"})
+EXCLUDE_STAR_KEYWORDS = frozenset({"去科技", "去科创板", "去科创"})
 # 仅「量化精选股票」使用 exclude_limit_up；一日游中写入仅剥离 token
 EXCLUDE_LIMIT_UP_KEYWORDS = frozenset({"去涨停", "剔涨停", "剔除涨停"})
 
 DEFAULT_QUANT_STOCK_MAX_SCAN = 150
 DEFAULT_QUANT_STOCK_TOP = 10
+# 「量化精选股票多空」单指令内最多智能分析只数（防误触超长耗时）
+MAX_QUANT_STOCK_DEBATE_CAP = 15
 
 DEFAULT_DAY_TRIP_TOP = 15
 MIN_DAY_TRIP_TOP = 1
@@ -142,23 +145,26 @@ def parse_name_maxscan_top(
 
 def split_exchange_exclude_keyword_tokens(
     tail: str,
-) -> tuple[list[str], bool, bool, bool]:
-    """分出剔除关键词与非关键词 token（含可选剔除近似涨停）。"""
+) -> tuple[list[str], bool, bool, bool, bool]:
+    """分出剔除关键词与非关键词 token（含可选剔除近似涨停、科创板）。"""
     parts = (tail or "").split()
     exclude_bse = False
     exclude_chinext = False
     exclude_limit_up = False
+    exclude_star = False
     rest: list[str] = []
     for p in parts:
         if p in EXCLUDE_BEIJING_KEYWORDS:
             exclude_bse = True
         elif p in EXCLUDE_CHINEXT_KEYWORDS:
             exclude_chinext = True
+        elif p in EXCLUDE_STAR_KEYWORDS:
+            exclude_star = True
         elif p in EXCLUDE_LIMIT_UP_KEYWORDS:
             exclude_limit_up = True
         else:
             rest.append(p)
-    return rest, exclude_bse, exclude_chinext, exclude_limit_up
+    return rest, exclude_bse, exclude_chinext, exclude_limit_up, exclude_star
 
 
 def parse_quant_stock_screen_tail(
@@ -166,12 +172,13 @@ def parse_quant_stock_screen_tail(
     *,
     default_max_scan: int = DEFAULT_QUANT_STOCK_MAX_SCAN,
     default_top: int = DEFAULT_QUANT_STOCK_TOP,
-) -> tuple[int, int, bool, bool, bool]:
+) -> tuple[int, int, bool, bool, bool, bool]:
     """
-    解析「量化精选股票」尾部：可选 去北交所/去北交、去创业板/去创、去涨停/剔涨停/剔除涨停，及 1～2 个正整数。
+    解析「量化精选股票」尾部：可选 去北交所/去北交、去创业板/去创、去科技/去科创板/去科创、
+    去涨停/剔涨停/剔除涨停，及 1～2 个正整数。
     无数字时为 default_max_scan / default_top；一个数字视为 max_scan；两个依次为 max_scan、top_n。
     """
-    rest, exclude_bse, exclude_chinext, exclude_limit_up = (
+    rest, exclude_bse, exclude_chinext, exclude_limit_up, exclude_star = (
         split_exchange_exclude_keyword_tokens(tail)
     )
     nums: list[int] = []
@@ -189,17 +196,78 @@ def parse_quant_stock_screen_tail(
         max_scan, top_n = nums[0], default_top
     else:
         max_scan, top_n = nums[0], nums[1]
-    return max_scan, top_n, exclude_bse, exclude_chinext, exclude_limit_up
+    return (
+        max_scan,
+        top_n,
+        exclude_bse,
+        exclude_chinext,
+        exclude_limit_up,
+        exclude_star,
+    )
+
+
+def parse_quant_stock_screen_debate_tail(
+    tail: str,
+    *,
+    default_max_scan: int = DEFAULT_QUANT_STOCK_MAX_SCAN,
+    default_top: int = DEFAULT_QUANT_STOCK_TOP,
+    max_debate_cap: int = MAX_QUANT_STOCK_DEBATE_CAP,
+) -> tuple[int, int, int, bool, bool, bool, bool]:
+    """
+    解析「量化精选股票多空」尾部：与「量化精选股票」相同的剔除关键词；
+    正整数可 1～3 个：依次为 max_scan、top_n、智能分析只数上限；
+    第三个上限会与 top_n 及 max_debate_cap 取最小值；未写第三个时分析只数为 min(top_n, max_debate_cap)。
+    """
+    rest, exclude_bse, exclude_chinext, exclude_limit_up, exclude_star = (
+        split_exchange_exclude_keyword_tokens(tail)
+    )
+    nums: list[int] = []
+    for x in rest:
+        if x.isdigit():
+            try:
+                v = int(x)
+                if v > 0:
+                    nums.append(v)
+            except ValueError:
+                pass
+    if len(nums) == 0:
+        max_scan, top_n = default_max_scan, default_top
+    elif len(nums) == 1:
+        max_scan, top_n = nums[0], default_top
+    elif len(nums) == 2:
+        max_scan, top_n = nums[0], nums[1]
+    else:
+        max_scan, top_n = nums[0], nums[1]
+        debate_cap = min(nums[2], top_n, max_debate_cap)
+        return (
+            max_scan,
+            top_n,
+            debate_cap,
+            exclude_bse,
+            exclude_chinext,
+            exclude_limit_up,
+            exclude_star,
+        )
+    debate_cap = min(top_n, max_debate_cap)
+    return (
+        max_scan,
+        top_n,
+        debate_cap,
+        exclude_bse,
+        exclude_chinext,
+        exclude_limit_up,
+        exclude_star,
+    )
 
 
 def parse_day_trip_tail(
     tail: str,
     *,
     default_top: int = DEFAULT_DAY_TRIP_TOP,
-) -> tuple[int, bool, bool]:
+) -> tuple[int, bool, bool, bool]:
     """解析「股票一日游」尾部：同上关键词（去涨停类 token 仅剥离不影响逻辑）；至多解读第一个正整数为展示条数（1～50）。"""
-    rest, exclude_bse, exclude_chinext, _ = split_exchange_exclude_keyword_tokens(
-        tail
+    rest, exclude_bse, exclude_chinext, _, exclude_star = (
+        split_exchange_exclude_keyword_tokens(tail)
     )
     nums: list[int] = []
     for x in rest:
@@ -213,4 +281,4 @@ def parse_day_trip_tail(
                 pass
     top_n = nums[0] if nums else default_top
     top_n = max(MIN_DAY_TRIP_TOP, min(MAX_DAY_TRIP_TOP, top_n))
-    return top_n, exclude_bse, exclude_chinext
+    return top_n, exclude_bse, exclude_chinext, exclude_star

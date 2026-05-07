@@ -80,10 +80,12 @@ def filter_spot_for_day_trip(
     min_volume_ratio: float = 1.5,
     exclude_bse: bool = False,
     exclude_chinext: bool = False,
+    exclude_star: bool = False,
 ) -> tuple[list[tuple[str, str]], dict[str, dict[str, float]], bool]:
     """
     从 A 股快照表筛选：涨跌幅 [pct_low, pct_high]、量比 > min_volume_ratio；
-    剔除停牌（无量）、B 股；可选剔除北交所/创业板（见 exclude_bse / exclude_chinext）。
+    剔除停牌（无量）、B 股；可选剔除北交所/创业板/科创板
+    （见 exclude_bse / exclude_chinext / exclude_star）。
 
     若无「量比」列但有「成交量」，则用全样本成交量中位数自建近似量比（第三项返回 True）。
 
@@ -153,7 +155,10 @@ def filter_spot_for_day_trip(
         if not c or _is_b_share(c):
             continue
         if should_exclude_a_share(
-            c, exclude_bse=exclude_bse, exclude_chinext=exclude_chinext
+            c,
+            exclude_bse=exclude_bse,
+            exclude_chinext=exclude_chinext,
+            exclude_star=exclude_star,
         ):
             continue
         nm = str(row[name_col]) if name_col in dd.columns else ""
