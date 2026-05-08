@@ -164,6 +164,11 @@ class StockAnalyzer:
                 return self._stock_cache
             raise
 
+    def invalidate_stock_cache(self) -> None:
+        """清空 A 股快照缓存，下次查询将重新拉取全市场行情。"""
+        self._stock_cache = None
+        self._stock_cache_time = None
+
     def _parse_stock_row_eastmoney(self, row, stock_code: str) -> StockInfo:
         """解析东方财富数据格式"""
         return StockInfo(

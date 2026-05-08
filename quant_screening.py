@@ -15,7 +15,7 @@ from typing import Any, Optional
 from astrbot.api import logger
 
 from .ai_analyzer.quant import QuantAnalyzer
-from .stock.exchange_filter import is_likely_limit_up, should_exclude_a_share
+from .stock.exchange_filter import should_exclude_a_share
 
 MIN_HISTORY_BARS = 20
 HISTORY_DAYS = 60
@@ -26,6 +26,8 @@ DEFAULT_SCREENING_CONCURRENCY = 1
 # 取得并发槽后、发请求前随机等待（秒），打散 burst；False 则关闭
 SCREENING_JITTER_ENABLED = True
 SCREENING_JITTER_SEC = (0.05, 0.2)
+# 「去涨停」前筛：剔除快照涨跌幅严格大于该阈值（%）；不按板块区分涨跌停幅度
+SCREENING_EXCLUDE_IF_CHANGE_PCT_GT = 9.0
 
 DISCLAIMER = (
     "\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -239,7 +241,7 @@ def _pandas_abs_change_pairs(
         if exclude_limit_up:
             raw_pct = pd.to_numeric(row.get(rate_col), errors="coerce")
             pct_f = 0.0 if pd.isna(raw_pct) else float(raw_pct)
-            if is_likely_limit_up(pct_f, c, nm):
+            if pct_f > SCREENING_EXCLUDE_IF_CHANGE_PCT_GT:
                 continue
         pairs.append((c, nm))
     return pairs

@@ -750,6 +750,7 @@ class EastMoneyAPI:
                                 "volume": 0.0,
                                 "amount": 0.0,
                                 "change_rate": change_rate,
+                                "turnover_rate": 0.0,  # 场外基金无换手率概念
                             })
                             
                             prev_close = close
@@ -819,6 +820,11 @@ class EastMoneyAPI:
                     parts = line.split(",")
                     if len(parts) >= 11:
                         try:
+                            # 换手率（%），有时为空字符串或缺省值
+                            try:
+                                turnover_rate = float(parts[10]) if parts[10] not in ("", "-") else 0.0
+                            except (ValueError, IndexError):
+                                turnover_rate = 0.0
                             history.append({
                                 "date": parts[0],
                                 "open": float(parts[1]),
@@ -828,6 +834,7 @@ class EastMoneyAPI:
                                 "volume": float(parts[5]),
                                 "amount": float(parts[6]),
                                 "change_rate": float(parts[8]) if parts[8] else 0.0,
+                                "turnover_rate": turnover_rate,
                             })
                         except (ValueError, IndexError) as e:
                             logger.debug(f"解析K线数据失败: {line}, 错误: {e}")
@@ -904,6 +911,7 @@ class EastMoneyAPI:
                             "volume": float(line[5]),
                             "amount": 0.0,
                             "change_rate": change_rate,
+                            "turnover_rate": 0.0,  # 腾讯源不返回换手率，下游做降级处理
                         })
                         prev_close = close
                     except (ValueError, IndexError):

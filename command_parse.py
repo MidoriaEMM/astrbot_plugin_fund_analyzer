@@ -35,6 +35,22 @@ DEFAULT_DAY_TRIP_TOP = 15
 MIN_DAY_TRIP_TOP = 1
 MAX_DAY_TRIP_TOP = 50
 
+# 「短线选股」默认参数
+DEFAULT_SHORT_TERM_MAX_SCAN = 200
+DEFAULT_SHORT_TERM_TOP = 10
+MIN_SHORT_TERM_MAX_SCAN = 1
+MAX_SHORT_TERM_MAX_SCAN = 500
+MIN_SHORT_TERM_TOP = 1
+MAX_SHORT_TERM_TOP = 50
+DEFAULT_SHORT_TERM_MIN_AMOUNT_YI = 1.0
+MIN_SHORT_TERM_MIN_AMOUNT_YI = 0.0
+MAX_SHORT_TERM_MIN_AMOUNT_YI = 1000.0
+
+# 「短线选股」资金流开关关键词（同义词族）
+SHORT_TERM_WITH_FUND_FLOW_KEYWORDS = frozenset({
+    "加资金流", "含资金流", "带资金流", "加主力", "含主力", "带主力", "加流向",
+})
+
 
 def get_event_plain_text(event: Any) -> str:
     """尽量兼容不同 AstrBot 版本的事件 API。"""
@@ -175,7 +191,7 @@ def parse_quant_stock_screen_tail(
 ) -> tuple[int, int, bool, bool, bool, bool]:
     """
     解析「量化精选股票」尾部：可选 去北交所/去北交、去创业板/去创、去科技/去科创板/去科创、
-    去涨停/剔涨停/剔除涨停，及 1～2 个正整数。
+    去涨停/剔涨停/剔除涨停：前筛剔除涨跌幅>9%（不按板块区分幅度），及 1～2 个正整数。
     无数字时为 default_max_scan / default_top；一个数字视为 max_scan；两个依次为 max_scan、top_n。
     """
     rest, exclude_bse, exclude_chinext, exclude_limit_up, exclude_star = (
@@ -257,6 +273,93 @@ def parse_quant_stock_screen_debate_tail(
         exclude_chinext,
         exclude_limit_up,
         exclude_star,
+    )
+
+
+_SHORT_TERM_AMOUNT_RE = re.compile(r"^(?:额)?(\d+(?:\.\d+)?)亿(?:额)?$")
+
+
+def _parse_short_term_amount_token(tok: str) -> float | None:
+    """识别成交额阈值 token，如 '额1亿' / '1.5亿' / '2亿额'，返回亿元数；不匹配返回 None。"""
+    m = _SHORT_TERM_AMOUNT_RE.match(tok or "")
+    if not m:
+        return None
+    try:
+        v = float(m.group(1))
+    except ValueError:
+        return None
+    return max(MIN_SHORT_TERM_MIN_AMOUNT_YI, min(MAX_SHORT_TERM_MIN_AMOUNT_YI, v))
+
+
+def parse_short_term_screen_tail(
+    tail: str,
+    *,
+    default_max_scan: int = DEFAULT_SHORT_TERM_MAX_SCAN,
+    default_top: int = DEFAULT_SHORT_TERM_TOP,
+    default_min_amount_yi: float = DEFAULT_SHORT_TERM_MIN_AMOUNT_YI,
+) -> tuple[int, int, float, bool, bool, bool, bool, bool]:
+    """
+    解析「短线选股」尾部参数。
+
+    支持任意顺序的：
+    - 关键词剔除：去北交所/去创业板/去科创板/去涨停（与「量化精选股票」一致）
+    - 成交额阈值：'额1亿' / '1.5亿' / '2亿额'（默认 1 亿，0 表示不过滤）
+    - 资金流开关：'加资金流' / '含资金流' / '加主力' 等同义词
+    - 1～2 个正整数：依次为 max_scan、top_n（默认 200/10）
+
+    Returns:
+        (max_scan, top_n, min_amount_yi, exclude_bse, exclude_chinext,
+         exclude_limit_up, exclude_star, with_fund_flow)
+    """
+    rest, exclude_bse, exclude_chinext, exclude_limit_up, exclude_star = (
+        split_exchange_exclude_keyword_tokens(tail)
+    )
+
+    min_amount_yi = float(default_min_amount_yi)
+    with_fund_flow = False
+    nums: list[int] = []
+    leftover: list[str] = []
+    for tok in rest:
+        if tok in SHORT_TERM_WITH_FUND_FLOW_KEYWORDS:
+            with_fund_flow = True
+            continue
+        amt = _parse_short_term_amount_token(tok)
+        if amt is not None:
+            min_amount_yi = amt
+            continue
+        if tok.isdigit():
+            try:
+                v = int(tok)
+                if v > 0:
+                    nums.append(v)
+                    continue
+            except ValueError:
+                pass
+        leftover.append(tok)
+    _ = leftover  # 当前忽略其他 token
+
+    if len(nums) == 0:
+        max_scan, top_n = default_max_scan, default_top
+    elif len(nums) == 1:
+        max_scan, top_n = nums[0], default_top
+    else:
+        max_scan, top_n = nums[0], nums[1]
+
+    max_scan = max(MIN_SHORT_TERM_MAX_SCAN, min(MAX_SHORT_TERM_MAX_SCAN, max_scan))
+    top_n = max(MIN_SHORT_TERM_TOP, min(MAX_SHORT_TERM_TOP, top_n))
+    min_amount_yi = max(
+        MIN_SHORT_TERM_MIN_AMOUNT_YI,
+        min(MAX_SHORT_TERM_MIN_AMOUNT_YI, float(min_amount_yi)),
+    )
+    return (
+        max_scan,
+        top_n,
+        min_amount_yi,
+        exclude_bse,
+        exclude_chinext,
+        exclude_limit_up,
+        exclude_star,
+        with_fund_flow,
     )
 
 

@@ -19,10 +19,16 @@ from astrbot.core.utils.t2i.renderer import HtmlRenderer
 
 # 导入股票分析模块
 from .stock import StockAnalyzer, StockInfo
+from .stock.exchange_filter import is_effectively_limit_up
 from .stock.day_trip import (
     filter_spot_for_day_trip,
     format_day_trip_report,
     run_day_trip_full,
+)
+from .stock.short_term import (
+    SHORT_TERM_MIN_BARS,
+    format_short_term_report,
+    screen_stocks_short_term,
 )
 from .stock.board_ak import (
     fetch_concept_cons,
@@ -43,6 +49,7 @@ from .command_parse import (
     parse_name_maxscan_top,
     parse_quant_stock_screen_debate_tail,
     parse_quant_stock_screen_tail,
+    parse_short_term_screen_tail,
     strip_command_prefix,
 )
 
@@ -2197,7 +2204,8 @@ class FundAnalyzerPlugin(Star):
         """
         从 A 股全市场行情中按 |涨跌幅| 取前 N 只，逐只拉日线并量化排序。
         用法: 量化精选股票 [候选只数] [输出条数] [去北交所] [去创业板] [去科技/去科创板/去科创] [去涨停/剔涨停/剔除涨停]
-        关键词可与数字任意顺序；默认候选150只、输出10条；不写关键词则全市场；不写「去科技」则含科创板；去涨停类默认不写则不剔除。
+        关键词可与数字任意顺序；默认候选150只、输出10条；不写关键词则全市场；不写「去科技」则含科创板；
+        「去涨停」类：前筛剔除当日涨跌幅>9%（不按板块区分涨跌停幅度）；默认不写则不剔除。
         """
         try:
             tail = strip_command_prefix(
@@ -2214,7 +2222,7 @@ class FundAnalyzerPlugin(Star):
             if exclude_star:
                 ex_notes.append("科创板")
             if exclude_limit_up:
-                ex_notes.append("涨停股")
+                ex_notes.append("涨>9%")
             ex_suffix = (
                 "，剔除：" + "、".join(ex_notes)
                 if ex_notes
@@ -2274,6 +2282,7 @@ class FundAnalyzerPlugin(Star):
         与「量化精选股票」相同筛股排序后，对前若干只依次执行「股票智能分析」，仅输出纯文本多空结论。
         用法: 量化精选股票多空 [候选只数] [输出条数] [智能分析只数上限] [去北交所] …（第三个数字可选）
         智能分析只数为 min(第三个数字, 输出条数, 全局上限)；未写第三个数字时为 min(输出条数, 全局上限)。剔除关键词与「量化精选股票」相同。
+        智能分析前会按板块（ST/双创/北交所等）再判涨停：涨停则跳过 LLM，仅输出「涨停」。
         """
         try:
             if not self.context.get_using_provider():
@@ -2304,7 +2313,7 @@ class FundAnalyzerPlugin(Star):
             if exclude_star:
                 ex_notes.append("科创板")
             if exclude_limit_up:
-                ex_notes.append("涨停股")
+                ex_notes.append("涨>9%")
             ex_suffix = (
                 "，剔除：" + "、".join(ex_notes)
                 if ex_notes
@@ -2314,8 +2323,8 @@ class FundAnalyzerPlugin(Star):
             yield event.plain_result(
                 f"⚖️ 量化精选股票多空{ex_suffix}：候选至多 {max_scan} 只 → TOP {top_n} → "
                 f"依次智能分析前 {debate_cap} 只（每只约 9 次 LLM，约 3～5 分钟；单指令上限 "
-                f"{MAX_QUANT_STOCK_DEBATE_CAP} 只）。\n"
-                "下面每条形如：代码 名称 看涨/看跌/中性"
+                f"{MAX_QUANT_STOCK_DEBATE_CAP} 只）。涨停标的跳过 LLM。\n"
+                "下面每条形如：代码 名称 看涨/看跌/中性（当前 ±x.xx%）（涨停亦附当前涨跌幅）"
             )
 
             raw, attempted = await screen_stocks_by_abs_pct(
@@ -2351,10 +2360,26 @@ class FundAnalyzerPlugin(Star):
                 )
                 return
 
+            self.stock_analyzer.invalidate_stock_cache()
+
             ok_n = 0
             fail_n = 0
+            skip_zt_n = 0
             dir_ok = frozenset({"看涨", "看跌", "中性"})
             for row in targets:
+                rt = await self.stock_analyzer.get_stock_realtime(row.code)
+                pct_txt = (
+                    f"（当前 {rt.change_rate:+.2f}%）" if rt is not None else ""
+                )
+                if rt is not None and is_effectively_limit_up(
+                    rt.code, rt.name, rt.change_rate
+                ):
+                    skip_zt_n += 1
+                    yield event.plain_result(
+                        f"{row.code} {row.name} 涨停{pct_txt}"
+                    )
+                    continue
+
                 debate_result, _info, err = await self._run_debate_pipeline_for_code(
                     row.code,
                     False,
@@ -2363,16 +2388,21 @@ class FundAnalyzerPlugin(Star):
                 if err:
                     fail_n += 1
                     short = (err.strip().split("\n") or [err])[0].strip()
-                    yield event.plain_result(f"{row.code} {row.name} 失败：{short}")
+                    yield event.plain_result(
+                        f"{row.code} {row.name} 失败：{short}{pct_txt}"
+                    )
                 else:
                     ok_n += 1
                     d = debate_result.final_direction
                     label = d if d in dir_ok else "中性"
-                    yield event.plain_result(f"{row.code} {row.name} {label}")
+                    yield event.plain_result(
+                        f"{row.code} {row.name} {label}{pct_txt}"
+                    )
 
             yield event.plain_result(
                 f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"完成：成功 {ok_n} 条，失败 {fail_n} 条。\n"
+                f"完成：成功 {ok_n} 条，失败 {fail_n} 条"
+                f"{'' if skip_zt_n == 0 else f'，跳过涨停 {skip_zt_n} 条'}。\n"
                 f"{DISCLAIMER.strip()}"
             )
 
@@ -2476,6 +2506,111 @@ class FundAnalyzerPlugin(Star):
             logger.debug("股票一日游 ImportError: %s", e)
         except Exception as e:
             logger.error(f"股票一日游出错: {e}")
+            yield event.plain_result(f"❌ 执行失败: {e}")
+
+    @filter.command("短线选股")
+    async def stock_short_term_screen(
+        self,
+        event: AstrMessageEvent,
+        max_scan_arg: str = "",
+        top_arg: str = "",
+    ):
+        """
+        基于量价因子的 1-3 日短线选股：动量 + 量能突破 + 量价共振 + 换手情绪 + 蓄势/位置 + 短期反弹。
+        可选启用「主力资金流向」因子（耗时 +30~50%）。
+        用法: 短线选股 [候选数] [输出条数] [额X亿] [加资金流] [去北交所] [去创业板] [去科技/去科创板/去科创] [去涨停]
+        关键词与数字可任意顺序；默认候选 200、输出 10、最小日成交额 1 亿；
+        '额2亿' / '1.5亿' 调成交额阈值（0 亿不过滤）；
+        '加资金流' / '含主力' 启用主力流向因子（顶部派发/底部吸筹/主散对冲）。
+        """
+        try:
+            tail = strip_command_prefix(get_event_plain_text(event), "短线选股")
+            (
+                max_scan,
+                top_n,
+                min_amount_yi,
+                exclude_bse,
+                exclude_chinext,
+                exclude_limit_up,
+                exclude_star,
+                with_fund_flow,
+            ) = parse_short_term_screen_tail(tail)
+
+            ex_notes: list[str] = []
+            if exclude_bse:
+                ex_notes.append("北交所")
+            if exclude_chinext:
+                ex_notes.append("创业板")
+            if exclude_star:
+                ex_notes.append("科创板")
+            if exclude_limit_up:
+                ex_notes.append("涨>9%")
+            ex_suffix = (
+                "，剔除：" + "、".join(ex_notes)
+                if ex_notes
+                else "（全市场）"
+            )
+
+            flow_notice = ""
+            time_hint = "约数分钟"
+            if with_fund_flow:
+                flow_notice = " + 主力流向（顶部派发/底部吸筹/主散对冲）"
+                time_hint = "约 5~7 分钟（含主力流向）"
+
+            yield event.plain_result(
+                f"🎯 短线选股{ex_suffix}：按 |涨跌幅| 取候选 {max_scan} 只"
+                f"（成交额≥{min_amount_yi}亿），输出 TOP {top_n}\n"
+                f"因子：动量 + 量能 + 量价共振 + 换手情绪 + 蓄势/位置 + 短期RSI{flow_notice}\n"
+                f"⏳ 正在拉取全市场行情与 60 日 K 线（{time_hint}）…"
+            )
+
+            lines, attempted, valid, with_flow_n = await screen_stocks_short_term(
+                self.stock_analyzer,
+                self.analyzer,
+                max_scan=max_scan,
+                min_amount_yi=min_amount_yi,
+                max_concurrent=DEFAULT_SCREENING_CONCURRENCY,
+                exclude_bse=exclude_bse,
+                exclude_chinext=exclude_chinext,
+                exclude_star=exclude_star,
+                exclude_limit_up=exclude_limit_up,
+                with_fund_flow=with_fund_flow,
+            )
+            if attempted == 0:
+                yield event.plain_result(
+                    "⚠️ 未得到候选标的（可能成交额阈值过高、关键词剔除过多或行情列缺失）。"
+                    + DISCLAIMER
+                )
+                return
+            if valid == 0:
+                yield event.plain_result(
+                    f"⚠️ 已对 {attempted} 只拉取日线，均无足够 K 线样本"
+                    f"（<{SHORT_TERM_MIN_BARS} 根），无法计算量价因子。"
+                    + DISCLAIMER
+                )
+                return
+
+            trunc = ""
+            if len(lines) > top_n:
+                trunc = f"💡 共 {len(lines)} 只入榜，仅展示前 {top_n}。\n"
+
+            text = format_short_term_report(
+                lines[:top_n],
+                candidate_count=attempted,
+                valid_count=valid,
+                truncation_note=trunc,
+                min_amount_yi=min_amount_yi,
+                with_fund_flow=with_fund_flow,
+                fund_flow_count=with_flow_n,
+            )
+            yield event.plain_result(text)
+        except ImportError as e:
+            yield event.plain_result(
+                "❌ 需要 akshare 拉取 A 股行情\n请执行: pip install akshare"
+            )
+            logger.debug("短线选股 ImportError: %s", e)
+        except Exception as e:
+            logger.error(f"短线选股出错: {e}")
             yield event.plain_result(f"❌ 执行失败: {e}")
 
     @filter.command("量化分析")
@@ -3289,9 +3424,10 @@ class FundAnalyzerPlugin(Star):
 🔹 基金分析 [代码] - 技术分析(均线/趋势)
 🔹 基金对比 [代码1] [代码2] - ⚖️对比两只基金
 🔹 量化精选基金 [分析上限] [输出条数] - 场内 LOF 列表批量量化排序（默认单页/top10，非投资建议）
-🔹 量化精选股票 [候选数] [输出条数] [去北交所] [去创业板] [去科技/去科创板/去科创] [去涨停/剔涨停/剔除涨停] - |涨跌幅|前筛+排序（默认150/10）；关键词可与数字任意顺序，不写则全市场；不写「去科技」则含科创板；剔除涨停默认关闭
-🔹 量化精选股票多空 [候选数] [输出条数] [智能分析上限] … - 同上筛选与剔除；第三数字可选，限制「股票智能分析」只数（默认不超过输出条数且单指令至多15只）；依次输出「代码 名称 看涨/看跌/中性」纯文本
+🔹 量化精选股票 [候选数] [输出条数] [去北交所] [去创业板] [去科技/去科创板/去科创] [去涨停/剔涨停/剔除涨停] - |涨跌幅|前筛+排序（默认150/10）；关键词可与数字任意顺序，不写则全市场；不写「去科技」则含科创板；「去涨停」为剔除涨跌幅>9%，默认关闭
+🔹 量化精选股票多空 [候选数] [输出条数] [智能分析上限] … - 同上筛选与剔除；第三数字可选，限制「股票智能分析」只数（默认不超过输出条数且单指令至多15只）；智能分析前按板块再判涨停，涨停跳过 LLM 仅输出说明；其余依次输出「代码 名称 看涨/看跌/中性」纯文本
 🔹 股票一日游 [展示条数] [去北交所] [去创业板] [去科技/去科创板/去科创] - 同上关键词；默认展示15最大50；3%~9%且量比>1.5→综合分前20%→分时（报告内说明量比近似）
+🔹 短线选股 [候选数] [输出条数] [额X亿] [加资金流] [去北交所] [去创业板] [去科技/去科创板/去科创] [去涨停] - 1-3日量价因子选股：动量+量能突破+量价共振+换手情绪+蓄势/位置+短期RSI；可选「加资金流/含主力」启用主力流向（顶部派发/底部吸筹/主散对冲，耗时+30~50%）；默认候选200/输出10/成交额≥1亿
 💡 东财快照含原生量比；新浪源多为自建近似。分时依赖当日分钟 K。
 💡 量化精选结果优先以图片呈现（首选本地渲染，不可用则尝试网络渲染；均失败时为文本表格）。
 💡 并发拉多档 K 线时若频繁断连，多为数据源限流或网络原因，可稍后重试或减少分析数量。
@@ -3329,6 +3465,10 @@ class FundAnalyzerPlugin(Star):
   • 量化精选股票多空 150 10 3
   • 量化精选股票多空 去创业板 150 10
   • 股票一日游 15 去创业板
+  • 短线选股 200 10
+  • 短线选股 去创业板 额2亿 200 10
+  • 短线选股 加资金流 200 10        （含主力流向因子）
+  • 短线选股 加主力 去涨停 150 8
   • 量化精选基金 400 10
   • 智能分析 161226
   • 股票智能分析 161226

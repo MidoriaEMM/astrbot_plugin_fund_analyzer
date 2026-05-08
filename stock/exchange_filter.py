@@ -6,8 +6,6 @@ from __future__ import annotations
 
 import re
 
-LIMIT_UP_EPS = 0.05
-
 
 def normalize_screening_code(raw: str) -> str:
     c = str(raw).strip()
@@ -75,15 +73,16 @@ def a_share_price_limit_pct(code: str, name: str) -> float:
     return 10.0
 
 
-def is_likely_limit_up(
-    change_pct: float,
+def is_effectively_limit_up(
     code: str,
     name: str,
+    change_rate_pct: float,
     *,
-    eps: float = LIMIT_UP_EPS,
+    eps_pct: float = 0.06,
 ) -> bool:
-    """根据快照涨跌幅与代码/名称判断是否近似涨停（涨侧触板）。"""
-    if change_pct <= 0:
-        return False
-    cap = a_share_price_limit_pct(code, name)
-    return change_pct >= cap - eps
+    """
+    是否视为当日涨停（近似）：涨跌幅 >= 该股涨跌停上限(%) - eps_pct。
+    eps_pct 用于吸收行情展示四舍五入与浮点误差。
+    """
+    lim = a_share_price_limit_pct(code, name)
+    return float(change_rate_pct) >= lim - eps_pct
