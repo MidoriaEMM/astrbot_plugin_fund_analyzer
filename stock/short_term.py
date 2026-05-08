@@ -870,7 +870,7 @@ async def screen_stocks_short_term(
         valid:        K 线足够形成因子的有效样本数
         with_flow_n:  with_fund_flow=True 时，成功取得资金流数据的样本数；False 时为 0
     """
-    df = await stock_analyzer._get_stock_data()
+    df = await stock_analyzer.get_a_share_spot_for_screening()
     if df is None or len(df) == 0:
         return [], 0, 0, 0
 

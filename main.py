@@ -12,7 +12,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
-from astrbot.api import logger
+from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.utils.t2i.renderer import HtmlRenderer
@@ -318,11 +318,15 @@ class FundAnalyzerPlugin(Star):
     # 用户设置文件名
     SETTINGS_FILE = "user_settings.json"
 
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.analyzer = FundAnalyzer()
-        # 初始化股票分析器
-        self.stock_analyzer = StockAnalyzer()
+        tf_key = (config.get("tickflow_api_key") or "").strip()
+        # 配置为空传 None，以便 StockAnalyzer 回退读取 TICKFLOW_API_KEY
+        self.stock_analyzer = StockAnalyzer(
+            tickflow_api_key=tf_key if tf_key else None
+        )
+        get_eastmoney_api().set_tickflow_api_key(tf_key if tf_key else None)
         # 初始化图片渲染器
         self.image_renderer = HtmlRenderer()
         # 是否使用本地图片生成器（优先使用）

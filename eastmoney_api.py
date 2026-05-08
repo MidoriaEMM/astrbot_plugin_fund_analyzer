@@ -7,6 +7,7 @@
 import asyncio
 import json
 import math
+import os
 import re
 from datetime import datetime, timedelta
 from typing import Optional
@@ -74,11 +75,13 @@ class EastMoneyAPI:
     # 备用数据源 - 新浪财经
     SINA_QUOTE_API = "https://hq.sinajs.cn/list="
     # 资金流向 API (场内)
-    FUND_FLOW_API = "http://push2.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    FUND_FLOW_API = "http://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
     # 资金流向备用源 - 东方财富 datacenter
     FUND_FLOW_DETAIL_API = "https://datacenter-web.eastmoney.com/api/data/v1/get"
     # 行业板块列表 / 成份（与网页 push2.eastmoney.com/api/qt/clist/get 抓包一致）
     PUSH2_CLIST_GET = "https://push2.eastmoney.com/api/qt/clist/get"
+    # 当日资金流向快照（ulist.np/get，secids 与 stock/get、fflow 的 market.code 一致）
+    PUSH2_ULIST_NP = "https://push2.eastmoney.com/api/qt/ulist.np/get"
 
     def __init__(self):
         # 缓存
@@ -87,6 +90,17 @@ class EastMoneyAPI:
         self._cache_ttl = 1800  # 30分钟缓存
         # 持久化 session（复用连接，减少 Server disconnected）
         self._session: Optional[aiohttp.ClientSession] = None
+        # Tickflow 日K（优先于 push2his）；None 时仍可读 TICKFLOW_API_KEY
+        self._tickflow_api_key: Optional[str] = None
+
+    def set_tickflow_api_key(self, key: Optional[str]) -> None:
+        """插件配置的 Key；空串归一为未设置，此时回退环境变量 TICKFLOW_API_KEY。"""
+        self._tickflow_api_key = (key or "").strip() or None
+
+    def _effective_tickflow_key(self) -> Optional[str]:
+        if self._tickflow_api_key:
+            return self._tickflow_api_key
+        return (os.getenv("TICKFLOW_API_KEY") or "").strip() or None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """获取或创建持久化 HTTP session（复用TCP连接）"""
@@ -787,6 +801,32 @@ class EastMoneyAPI:
         Returns:
             历史数据列表或 None
         """
+        tf_key = self._effective_tickflow_key()
+        if tf_key:
+            try:
+                from .tickflow_client.klines import (
+                    fetch_daily_klines_as_eastmoney_history,
+                )
+
+                hist = await asyncio.to_thread(
+                    fetch_daily_klines_as_eastmoney_history,
+                    tf_key,
+                    fund_code,
+                    days,
+                    adjust,
+                )
+                d_need = max(int(days), 1)
+                min_required = min(d_need, 5)
+                if hist and len(hist) >= min_required:
+                    logger.info(
+                        f"场内K线优先 Tickflow 日K: {fund_code}，{len(hist)} 条"
+                    )
+                    return hist
+            except ImportError as e:
+                logger.warning(f"Tickflow K 线模块不可用: {e}")
+            except Exception as e:
+                logger.warning(f"Tickflow 日K 失败，回退东财 push2his: {e}")
+
         market = self._get_market_code(fund_code)
         
         # 复权类型转换
@@ -1121,6 +1161,72 @@ class EastMoneyAPI:
             if realtime.get("change_amount") is not None:
                 fund["change_amount"] = realtime["change_amount"]
     
+    async def get_fund_flow_today_ulist(
+        self, fund_code: str, prefer_otc: Optional[bool] = None
+    ) -> Optional[dict]:
+        """
+        东方财富 push2「当日」资金流向快照（ulist.np/get），与 get_fund_flow 日 K 历史互补。
+
+        东财字段与返回 dict 键名对照:
+            f62 / f184 -> main_net_inflow / main_net_inflow_ratio（今日主力净流入 净额 / 净占比）
+            f66 / f69 -> super_large_net_inflow / super_large_net_inflow_ratio（超大单）
+            f72 / f75 -> large_net_inflow / large_net_inflow_ratio（大单）
+            f78 / f81 -> medium_net_inflow / medium_net_inflow_ratio（中单）
+            f84 / f87 -> small_net_inflow / small_net_inflow_ratio（小单）
+            f12 / f14 -> code / name（代码 / 名称，可选）
+
+        Args:
+            fund_code: 场内 ETF/LOF/股票 6 位代码
+            prefer_otc: True 时返回 None；False 强制拉场内；None 时用 _is_otc_fund 判断
+
+        Returns:
+            扁平 dict（含 code、name 及上述资金流字段），失败或场外为 None
+        """
+        fund_code = str(fund_code).strip()
+        if prefer_otc is True:
+            return None
+        if prefer_otc is None and self._is_otc_fund(fund_code):
+            return None
+
+        market = self._get_market_code(fund_code)
+        params = {
+            "secids": f"{market}.{fund_code}",
+            "fields": "f12,f14,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87",
+            "fltt": "2",
+            "ut": "b2884a393a59ad64002292a3e90d46a5",
+        }
+        data = await self._request(self.PUSH2_ULIST_NP, params)
+        if not data or data.get("rc") != 0:
+            return None
+
+        rows = (data.get("data") or {}).get("diff") or []
+        if not rows:
+            return None
+        row = rows[0]
+
+        def sf(val):
+            if val is None or val == "-" or val == "":
+                return 0.0
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                return 0.0
+
+        return {
+            "code": str(row.get("f12") or fund_code),
+            "name": str(row.get("f14") or ""),
+            "main_net_inflow": sf(row.get("f62")),
+            "main_net_inflow_ratio": sf(row.get("f184")),
+            "super_large_net_inflow": sf(row.get("f66")),
+            "super_large_net_inflow_ratio": sf(row.get("f69")),
+            "large_net_inflow": sf(row.get("f72")),
+            "large_net_inflow_ratio": sf(row.get("f75")),
+            "medium_net_inflow": sf(row.get("f78")),
+            "medium_net_inflow_ratio": sf(row.get("f81")),
+            "small_net_inflow": sf(row.get("f84")),
+            "small_net_inflow_ratio": sf(row.get("f87")),
+        }
+
     async def get_fund_flow(
         self, fund_code: str, days: int = 10, prefer_otc: Optional[bool] = None
     ) -> Optional[list[dict]]:
@@ -1172,10 +1278,12 @@ class EastMoneyAPI:
         }
         
         data = await self._request(self.FUND_FLOW_API, params)
+        logger.debug(f"东方财富 push2 资金流向 API: {data}")
         if not data or data.get("rc") != 0:
             return None
         
         klines = data.get("data", {}).get("klines", [])
+        logger.debug(f"东方财富 push2 资金流向 API: {klines}")
         if not klines:
             return None
         

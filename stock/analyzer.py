@@ -6,6 +6,7 @@ A股股票分析器
 
 import asyncio
 import math
+import os
 from datetime import datetime
 from typing import Any
 
@@ -18,7 +19,7 @@ DEFAULT_TIMEOUT = 60
 # A股实时行情缓存有效期（秒）
 STOCK_CACHE_TTL = 600  # 10分钟
 # 网络请求最大重试次数
-MAX_RETRIES = 3
+MAX_RETRIES = 1
 # 重试间隔（秒）
 RETRY_DELAY = 2
 
@@ -26,7 +27,7 @@ RETRY_DELAY = 2
 class StockAnalyzer:
     """A股股票分析器"""
 
-    def __init__(self):
+    def __init__(self, tickflow_api_key: str | None = None):
         self._ak = None
         self._pd = None
         self._initialized = False
@@ -34,7 +35,13 @@ class StockAnalyzer:
         self._stock_cache = None
         self._stock_cache_time = None
         # 当前使用的数据源
-        self._current_source = "eastmoney"  # 可选: eastmoney, sina
+        self._current_source = "eastmoney"  # 可选: tickflow, eastmoney, sina
+        _tf = (
+            tickflow_api_key
+            if tickflow_api_key is not None
+            else os.getenv("TICKFLOW_API_KEY")
+        )
+        self._tickflow_key = (_tf or "").strip() or None
 
     async def _ensure_init(self):
         """确保akshare已初始化"""
@@ -164,6 +171,31 @@ class StockAnalyzer:
                 return self._stock_cache
             raise
 
+    async def get_a_share_spot_for_screening(self) -> Any:
+        """
+        量化精选 / 短线选股前筛用：已配置 Tickflow 时优先拉 CN_Equity_A 全市场快照；
+        成功时不写入 _stock_cache；失败或未配置 Key 时回退 _get_stock_data()（AKShare）。
+        """
+        if self._tickflow_key:
+            try:
+                from ..tickflow_client import fetch_cn_equity_a_spot_dataframe
+
+                df = await asyncio.to_thread(
+                    fetch_cn_equity_a_spot_dataframe, self._tickflow_key
+                )
+                if df is not None and len(df) > 0:
+                    self._current_source = "tickflow"
+                    logger.info(
+                        f"A股前筛快照（Tickflow CN_Equity_A）共 {len(df)} 条"
+                    )
+                    return df
+            except ImportError as e:
+                logger.warning(f"Tickflow 全市场快照不可用（依赖缺失）: {e}")
+            except Exception as e:
+                logger.warning(f"Tickflow 全市场快照失败，回退 AKShare: {e}")
+
+        return await self._get_stock_data()
+
     def invalidate_stock_cache(self) -> None:
         """清空 A 股快照缓存，下次查询将重新拉取全市场行情。"""
         self._stock_cache = None
@@ -247,6 +279,24 @@ class StockAnalyzer:
         # 确保股票代码是字符串格式
         stock_code = str(stock_code).strip()
         logger.debug(f"查询股票代码: '{stock_code}'")
+
+        if self._tickflow_key:
+            try:
+                from ..tickflow_client import (
+                    fetch_quote_realtime,
+                    quote_to_stock_fields,
+                )
+
+                q = await asyncio.to_thread(
+                    fetch_quote_realtime, self._tickflow_key, stock_code
+                )
+                if isinstance(q, dict) and q:
+                    self._current_source = "tickflow"
+                    return StockInfo(**quote_to_stock_fields(q, stock_code))
+            except ImportError as e:
+                logger.warning(f"Tickflow 未安装或不可导入，跳过该数据源: {e}")
+            except Exception as e:
+                logger.warning(f"Tickflow 获取行情失败，回退 AKShare 全表: {e}")
 
         try:
             # 获取A股实时行情（使用缓存）

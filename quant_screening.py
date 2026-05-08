@@ -258,7 +258,7 @@ async def screen_stocks_by_abs_pct(
     exclude_star: bool = False,
     exclude_limit_up: bool = False,
 ) -> tuple[list[ScreeningRow], int]:
-    df = await stock_analyzer._get_stock_data()
+    df = await stock_analyzer.get_a_share_spot_for_screening()
     if df is None or len(df) == 0:
         return [], 0
     pairs = _pandas_abs_change_pairs(
