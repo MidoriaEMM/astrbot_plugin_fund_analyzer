@@ -56,6 +56,7 @@ from .command_parse import (
     parse_quant_stock_screen_debate_tail,
     parse_quant_stock_screen_position_tail,
     parse_quant_stock_screen_tail,
+    parse_stock_smart_analysis_tail,
     parse_short_term_batch_tail,
     parse_short_term_screen_tail,
     parse_wyckoff_batch_tail,
@@ -695,6 +696,7 @@ class FundAnalyzerPlugin(Star):
         top_rows: list,
         candidate_count: int,
         valid_count: int,
+        prefer_image: bool = True,
     ):
         text_fallback = format_screening_plain(
             title=title,
@@ -702,6 +704,9 @@ class FundAnalyzerPlugin(Star):
             candidate_count=candidate_count,
             valid_count=valid_count,
         )
+        if not prefer_image:
+            yield event.plain_result(text_fallback)
+            return
         tpl = self._resolve_screening_template_path()
         if tpl is None:
             yield event.plain_result(text_fallback)
@@ -2325,15 +2330,17 @@ class FundAnalyzerPlugin(Star):
     ):
         """
         从 A 股全市场行情中按 |涨跌幅| 取前 N 只，逐只拉日线并量化排序。
-        用法: 量化精选股票 [候选只数] [输出条数] [去北交所] [去创业板] [去科技/去科创板/去科创] [去涨停/剔涨停/剔除涨停] [含ST 可选]
-        关键词可与数字任意顺序；默认候选150只、输出10条；不写关键词则全市场；不写「去科技」则含科创板；
-        「去涨停」类：前筛剔除当日涨跌幅>9%（不按板块区分涨跌停幅度）；默认剔除 *ST/ST 风险警示股，写「含ST」「带ST」「不去ST」「保留ST」则保留。
+        用法: 量化精选股票 [候选只数] [输出条数] [去北交所/含北交所 …] [去创业板/含创业板 …] [去科技/含科技 …] [去涨停…] [含ST 可选]
+        关键词可与数字任意顺序；默认候选150只、输出10条；默认剔除北交所、创业板、科创板（可用 含北交/含创/含科技 等恢复）；
+        默认输出纯文本榜单；需 HTML 报告图时加「发图」或「出图」等；
+        「去*」与同条中「含*」并存时以「去*」为准；「去涨停」类：前筛剔除当日涨跌幅>9%（不按板块区分涨跌停幅度）；
+        默认剔除 *ST/ST 风险警示股，写「含ST」「带ST」「不去ST」「保留ST」则保留。
         """
         try:
             tail = strip_command_prefix(
                 get_event_plain_text(event), "量化精选股票"
             )
-            max_scan, top_n, exclude_bse, exclude_chinext, exclude_limit_up, exclude_star, exclude_st = (
+            max_scan, top_n, exclude_bse, exclude_chinext, exclude_limit_up, exclude_star, exclude_st, want_image = (
                 parse_quant_stock_screen_tail(tail)
             )
             ex_notes: list[str] = []
@@ -2393,6 +2400,7 @@ class FundAnalyzerPlugin(Star):
                 top_rows=top_rows,
                 candidate_count=attempted,
                 valid_count=len(raw),
+                prefer_image=want_image,
             ):
                 yield msg
         except ImportError as e:
@@ -2407,8 +2415,9 @@ class FundAnalyzerPlugin(Star):
     async def quant_screen_stocks_debate_plain(self, event: AstrMessageEvent):
         """
         与「量化精选股票」相同筛股排序后，对前若干只依次执行「股票智能分析」，仅输出纯文本多空结论。
-        用法: 量化精选股票多空 [候选只数] [输出条数] [智能分析只数上限] [去北交所] …（第三个数字可选）
-        智能分析只数为 min(第三个数字, 输出条数, 全局上限)；未写第三个数字时为 min(输出条数, 全局上限)。剔除关键词与「量化精选股票」相同。
+        用法: 量化精选股票多空 [候选只数] [输出条数] [智能分析只数上限] [板块/涨停/ST 关键词 …]（第三个数字可选）
+        智能分析只数为 min(第三个数字, 输出条数, 全局上限)；未写第三个数字时为 min(输出条数, 全局上限)。
+        剔除关键词、默认板块范围与「量化精选股票」相同（默认剔北交所/创业板/科创板，可用含*恢复）。
         智能分析前会按板块（ST/双创/北交所等）再判涨停：涨停则跳过 LLM，仅输出「涨停」。
         """
         try:
@@ -2553,6 +2562,7 @@ class FundAnalyzerPlugin(Star):
         与「量化精选股票多空」同源筛股与辩论；额外解析本金与风控参数，输出结构化快照与日 K 对齐指标，
         并按 score 加权给出整手仓位演示（不构成投资建议）。
         用法示例：量化精选仓位计划 本金100万 150 10 3 风险1% 止损2ATR 分0.7 额均2亿 单票20% 最多5只 去涨停
+        （筛股板块默认与「量化精选股票」相同：默认剔北交所/创业板/科创板。）
         """
         try:
             if not self.context.get_using_provider():
@@ -2587,7 +2597,7 @@ class FundAnalyzerPlugin(Star):
                 yield event.plain_result(
                     "❌ 请在尾部指定本金，例如：本金100万、本金50w、本金1000000（元）\n"
                     "💡 可选：风险1% 或 风险0.01 | 止损2ATR | 分0.7 | 额均2亿 | 单票20% | 最多5只\n"
-                    "（其余数字与剔除关键词与「量化精选股票多空」相同）"
+                    "（其余数字与板块/涨停/ST 关键词与「量化精选股票多空」相同；默认剔北交所、创业板、科创板。）"
                 )
                 return
 
@@ -2790,7 +2800,8 @@ class FundAnalyzerPlugin(Star):
         """
         基于量价因子的 1-3 日短线选股：动量 + 量能突破 + 量价共振 + 换手情绪 + 蓄势/位置 + 短期反弹。
         可选「加资金流」「加大盘」「加触发」（详见尾部关键词）。
-        用法: 短线选股 [候选数] [输出条数] [额X亿] [加资金流] [加大盘] [加触发] [去北交所] …
+        用法: 短线选股 [候选数] [输出条数] [额X亿] [加资金流] [加大盘] [加触发] [去北交所/含北交所 …] …
+        默认剔除北交所、创业板、科创板（可用 含北交/含创/含科技 等纳入；与「量化精选股票」规则一致）；
         默认剔除 *ST/ST；「含ST」「带ST」「不去ST」「保留ST」可保留风险警示股。
         关键词与数字可任意顺序；默认候选 200、输出 10、最小日成交额 1 亿；
         「加大盘」拉上证指数并按档位温和缩放总分；「加触发」展示威科夫主触发并小额加减分。
@@ -3042,7 +3053,8 @@ class FundAnalyzerPlugin(Star):
     async def stock_wyckoff_screen(self, event: AstrMessageEvent):
         """
         威科夫启发式七维打分（大盘/阶段/触发/量价/均线/赔率/仓位），与「短线选股」候选规则相近但因子独立。
-        用法: 威科夫选股 [候选数] [输出条数] [额X亿] [去北交所] [去创业板/去创/去创业] [去科技/去科创] [去涨停] [含ST 可选]
+        用法: 威科夫选股 [候选数] [输出条数] [额X亿] [板块关键词…] [去涨停] [含ST 可选]
+        默认剔除北交所、创业板、科创板（可用 含北交/含创/含科技 等恢复；规则同「量化精选股票」）；
         默认剔除 *ST/ST；「含ST」等同理可保留风险警示股。
         （不支持「加资金流」）
         """
@@ -3217,19 +3229,23 @@ class FundAnalyzerPlugin(Star):
         """
         纯量化分析（无需大模型）
         包含绩效指标、技术指标、策略回测
-        用法: 量化分析 [基金代码]
-        示例: 量化分析 161226
+        用法: 量化分析 [基金代码] [发图|出图|要图|图片]
+        默认输出文本；需报告图时在尾部加「发图」等关键词。
+        示例: 量化分析 161226、量化分析 161226 发图
         """
         try:
             user_id = event.get_sender_id()
+            tail = strip_command_prefix(
+                get_event_plain_text(event), "量化分析"
+            )
+            if not tail.strip() and (str(code or "").strip()):
+                tail = str(code).strip()
+            code_tail, want_image, _ = parse_stock_smart_analysis_tail(tail)
             fund_code, prefer_otc, normalized_code = self._parse_fund_command_input(
-                code, user_id
+                code_tail, user_id
             )
 
-            yield event.plain_result(
-                f"📊 正在对基金 {fund_code} 进行量化分析...\n"
-                "🔢 计算绩效指标、技术指标、策略回测中..."
-            )
+            yield event.plain_result(f"📊 正在对 {fund_code} 进行量化分析…")
 
             # 1. 获取基金基本信息
             info = await self.analyzer.get_lof_realtime(
@@ -3276,6 +3292,7 @@ class FundAnalyzerPlugin(Star):
 
             # 3. 使用量化分析器生成报告（无需 LLM）
             quant_report = self.ai_analyzer.get_quant_summary(history)
+            signal, score = self.ai_analyzer.get_technical_signal(history)
 
             # 4. 输出报告
             header = f"""
@@ -3288,10 +3305,7 @@ class FundAnalyzerPlugin(Star):
 ━━━━━━━━━━━━━━━━━
 """.strip()
 
-            yield event.plain_result(f"{header}\n\n{quant_report}")
-
-            # 添加说明
-            yield event.plain_result(
+            footer_notes = (
                 "━━━━━━━━━━━━━━━━━\n"
                 "📌 指标说明:\n"
                 "• 夏普比率 > 1 表示风险调整后收益较好\n"
@@ -3301,6 +3315,79 @@ class FundAnalyzerPlugin(Star):
                 "━━━━━━━━━━━━━━━━━\n"
                 "💡 使用「智能分析」可获取 AI 深度解读"
             )
+
+            if not want_image:
+                yield event.plain_result(f"{header}\n\n{quant_report}")
+                yield event.plain_result(footer_notes)
+                return
+
+            try:
+                import markdown
+
+                formatted_content = markdown.markdown(
+                    quant_report, extensions=["nl2br", "tables", "fenced_code"]
+                )
+            except ImportError:
+                import re
+
+                formatted_content = re.sub(
+                    r"\*\*(.*?)\*\*", r"<strong>\1</strong>", quant_report
+                )
+                formatted_content = formatted_content.replace("\n", "<br>")
+
+            data = {
+                "fund_name": info.name,
+                "fund_code": info.code,
+                "latest_price": info.latest_price,
+                "change_amount": info.change_amount,
+                "change_rate": info.change_rate,
+                "signal": signal,
+                "score": score,
+                "analysis_content": formatted_content,
+                "generated_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+            template_path = self._data_dir / "templates" / "quant_analysis_report.html"
+            if not template_path.exists():
+                template_path = (
+                    Path(__file__).parent / "templates" / "quant_analysis_report.html"
+                )
+
+            if not template_path.exists():
+                yield event.plain_result(f"{header}\n\n{quant_report}")
+                yield event.plain_result(footer_notes)
+                return
+
+            rendered_image = False
+            if self.use_local_renderer:
+                try:
+                    img_path = await render_fund_image(
+                        template_path=template_path,
+                        template_data=data,
+                        width=480,
+                    )
+                    yield event.image_result(img_path)
+                    rendered_image = True
+                except Exception as e:
+                    logger.warning(f"量化分析本地渲染失败，尝试远程: {e}")
+
+            if not rendered_image:
+                try:
+                    with open(template_path, "r", encoding="utf-8") as f:
+                        template_str = f.read()
+                    img_url = await self.image_renderer.render_custom_template(
+                        tmpl_str=template_str,
+                        tmpl_data=data,
+                        return_url=True,
+                    )
+                    yield event.image_result(img_url)
+                    rendered_image = True
+                except Exception as e:
+                    logger.warning(f"量化分析远程渲染失败，回退文本: {e}")
+
+            if not rendered_image:
+                yield event.plain_result(f"{header}\n\n{quant_report}")
+                yield event.plain_result(footer_notes)
 
         except ImportError:
             yield event.plain_result(
@@ -3544,19 +3631,26 @@ class FundAnalyzerPlugin(Star):
     async def multi_agent_debate(self, event: AstrMessageEvent, code: str = ""):
         """
         多智能体博弈分析（6 Agent + 多空辩论 + 博弈论裁定）
-        用法: 股票智能分析 [基金/股票代码]
-        示例: 股票智能分析 161226
+        用法: 股票智能分析 [基金/股票代码] [发图|出图|要图|图片] [详进度|详细进度|显示进度]
+        默认仅输出结论文本；需 HTML 报告图时在尾部加「发图」等关键词；「详进度」可输出各阶段说明。
+        示例: 股票智能分析 161226、股票智能分析 600519 发图
         """
         try:
             user_id = event.get_sender_id()
+            tail = strip_command_prefix(
+                get_event_plain_text(event), "股票智能分析"
+            )
+            if not tail.strip() and (str(code or "").strip()):
+                tail = str(code).strip()
+            code_tail, want_image, want_verbose_progress = (
+                parse_stock_smart_analysis_tail(tail)
+            )
             fund_code, prefer_otc, normalized_code = self._parse_fund_command_input(
-                code, user_id
+                code_tail, user_id
             )
 
             yield event.plain_result(
-                f"⚖️ 即将对 {fund_code} 启动多智能体博弈分析\n"
-                "🧠 6 位 AI 分析师 + 多空辩论 + 博弈论裁定\n"
-                "📡 正在采集数据，预计需要 3-5 分钟..."
+                f"⚖️ 正在分析 {fund_code}（约 3～5 分钟）…"
             )
 
             progress_messages: list[str] = []
@@ -3577,12 +3671,26 @@ class FundAnalyzerPlugin(Star):
             from .stock.debate_engine import DebateEngine
 
             engine = DebateEngine(self.context)
+            summary = engine.format_debate_summary(debate_result)
 
-            # 6. 发送进度汇总
-            if progress_messages:
+            if want_verbose_progress and progress_messages:
                 yield event.plain_result("\n".join(progress_messages))
 
-            # 7. 尝试渲染图片报告
+            if not want_image:
+                yield event.plain_result(summary)
+                return
+
+            template_path = self._data_dir / "templates" / "debate_report.html"
+            if not template_path.exists():
+                template_path = (
+                    Path(__file__).parent / "templates" / "debate_report.html"
+                )
+
+            if not template_path.exists():
+                yield event.plain_result(summary)
+                return
+
+            # 以下为报告图渲染（仅「发图」等关键词时执行）
             def _md_to_html(text: str) -> str:
                 """将 Markdown 文本转换为 HTML（内置实现，无外部依赖）"""
                 import re as _re
@@ -3814,47 +3922,35 @@ class FundAnalyzerPlugin(Star):
                 "generated_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
 
-            template_path = self._data_dir / "templates" / "debate_report.html"
-            if not template_path.exists():
-                template_path = (
-                    Path(__file__).parent / "templates" / "debate_report.html"
-                )
+            # 渲染图片：本地 → 远程；均失败则仅文本摘要
+            rendered_image = False
+            if self.use_local_renderer:
+                try:
+                    img_path = await render_fund_image(
+                        template_path=template_path,
+                        template_data=tmpl_data,
+                        width=520,
+                    )
+                    yield event.image_result(img_path)
+                    rendered_image = True
+                except Exception as e:
+                    logger.warning(f"本地渲染失败，尝试远程渲染: {e}")
 
-            summary = engine.format_debate_summary(debate_result)
+            if not rendered_image:
+                try:
+                    with open(template_path, encoding="utf-8") as f:
+                        template_str = f.read()
+                    img_url = await self.image_renderer.render_custom_template(
+                        tmpl_str=template_str,
+                        tmpl_data=tmpl_data,
+                        return_url=True,
+                    )
+                    yield event.image_result(img_url)
+                    rendered_image = True
+                except Exception as e:
+                    logger.warning(f"远程渲染失败，回退文本输出: {e}")
 
-            if not template_path.exists():
-                yield event.plain_result(summary)
-            else:
-                # 渲染图片：本地 → 远程；均失败则文本摘要
-                rendered_image = False
-                if self.use_local_renderer:
-                    try:
-                        img_path = await render_fund_image(
-                            template_path=template_path,
-                            template_data=tmpl_data,
-                            width=520,
-                        )
-                        yield event.image_result(img_path)
-                        rendered_image = True
-                    except Exception as e:
-                        logger.warning(f"本地渲染失败，尝试远程渲染: {e}")
-
-                if not rendered_image:
-                    try:
-                        with open(template_path, encoding="utf-8") as f:
-                            template_str = f.read()
-                        img_url = await self.image_renderer.render_custom_template(
-                            tmpl_str=template_str,
-                            tmpl_data=tmpl_data,
-                            return_url=True,
-                        )
-                        yield event.image_result(img_url)
-                        rendered_image = True
-                    except Exception as e:
-                        logger.warning(f"远程渲染失败，回退文本输出: {e}")
-
-                # 出图成功时先发图，再发摘要；仅文本回退时也发同一份摘要
-                yield event.plain_result(summary)
+            yield event.plain_result(summary)
 
         except ImportError:
             yield event.plain_result(
@@ -4033,18 +4129,19 @@ class FundAnalyzerPlugin(Star):
 🔹 基金分析 [代码] - 技术分析(均线/趋势)
 🔹 基金对比 [代码1] [代码2] - ⚖️对比两只基金
 🔹 量化精选基金 [分析上限] [输出条数] - 场内 LOF 列表批量量化排序（默认单页/top10，非投资建议）
-🔹 量化精选股票 [候选数] [输出条数] [去北交所] [去创业板] [去科技/去科创板/去科创] [去涨停/剔涨停/剔除涨停] - |涨跌幅|前筛+排序（默认150/10）；关键词可与数字任意顺序，不写则全市场；不写「去科技」则含科创板；「去涨停」为剔除涨跌幅>9%，默认关闭
+🔹 量化精选股票 [候选数] [输出条数] [发图可选] [去北交所/含北交 …] … - |涨跌幅|前筛+排序（默认150/10）；默认**文本**结果；需图加「发图」等；默认剔除北交所、创业板、科创板（可用含*恢复）；「去涨停」为剔除涨跌幅>9%，默认关闭
 🔹 量化精选股票多空 [候选数] [输出条数] [智能分析上限] … - 同上筛选与剔除；第三数字可选，限制「股票智能分析」只数（默认不超过输出条数且单指令至多15只）；智能分析前按板块再判涨停，涨停跳过 LLM 仅输出说明；其余依次输出「代码 名称 看涨/看跌/中性」纯文本
 🔹 量化精选仓位计划 [本金…] [候选数] [输出条数] [智能分析上限] … - 同上辩论流程；须指定本金（如本金100万）；可选 风险1%/风险0.01、止损2ATR、分0.7、额均2亿、单票20%、最多5只；输出结构化快照（score/ts/日K对齐）与整手仓位演示+JSON（非投资建议）
-🔹 短线选股 [候选数] [输出条数] [额X亿] [加资金流] [加大盘] [加触发] [剔除关键词…] - |涨跌幅|候选 + 量价因子排序；「加大盘」拉上证并按档位缩放总分；「加触发」展示威科夫主触发并小额加减分；与「威科夫选股」候选近似但默认打分不同
+🔹 短线选股 [候选数] [输出条数] [额X亿] [加资金流] [加大盘] [加触发] [剔除关键词…] - |涨跌幅|候选 + 量价因子排序；默认剔北交所/创业板/科创板（可用含*恢复）；「加大盘」拉上证并按档位缩放总分；「加触发」展示威科夫主触发并小额加减分；与「威科夫选股」候选近似但默认打分不同
 🔹 短线批量分析 <代码…> [加资金流] [加大盘] [加触发] [展示条数] - 同源量价因子批量打分；单次最多约40只；展示条数默认20、最大50
-🔹 威科夫选股 [候选数] [输出条数] [额X亿] [剔除关键词…] - 上证盘面水温 + 阶段/触发/量价/均线/赔率/仓位建议（启发式，不含资金流）；候选规则贴近短线选股；单次拉上证指数一次；有效样本需不少于约52根日K
+🔹 威科夫选股 [候选数] [输出条数] [额X亿] [剔除关键词…] - 上证盘面水温 + 阶段/触发/量价/均线/赔率/仓位建议（启发式，不含资金流）；默认剔北交所/创业板/科创板（可用含*恢复）；候选规则贴近短线选股；单次拉上证指数一次；有效样本需不少于约52根日K
 🔹 威科夫批量分析 <代码…> [展示条数] - 对指定代码输出同上威科夫七维报告（与短线打分无关）；「加资金流」写入会被忽略；单次最多约40只
 💡 东财快照含原生量比；新浪源多为自建近似。分时依赖当日分钟 K。
-💡 量化精选结果优先以图片呈现（首选本地渲染，不可用则尝试网络渲染；均失败时为文本表格）。
+💡 量化精选基金 / 板块量化等仍以发图为优先（失败则文本）；「量化精选股票」默认文本，加「发图」出图。
 💡 并发拉多档 K 线时若频繁断连，多为数据源限流或网络原因，可稍后重试或减少分析数量。
+🔹 量化分析 [代码] [发图|出图|要图|图片] - 绩效/技术/回测（无LLM）；默认文本报告；需图加「发图」等
 🔹 智能分析 [代码] - 🤖AI量化深度分析
-🔹 股票智能分析 [代码] - ⚖️多智能体博弈分析
+🔹 股票智能分析 [代码] [发图|出图|要图|图片] [详进度…] - ⚖️多智能体博弈；默认仅结论文本；需报告图时加「发图」等；「详进度」输出阶段说明
 🔹 基金历史 [代码] [天数] - 查看历史行情
 🔹 搜索基金 关键词 - 搜索LOF基金
 🔹 设置基金 代码 - 设置默认基金
@@ -4071,15 +4168,15 @@ class FundAnalyzerPlugin(Star):
   • 基金分析
   • 基金对比 161226 513100
   • 量化精选股票 150 10
-  • 量化精选股票 去北交所 去创业板 150 10
-  • 量化精选股票 去科技 150 10
+  • 量化精选股票 发图 150 10
+  • 量化精选股票 含科技 含创业板 150 10
   • 量化精选股票 去涨停 150 10
   • 量化精选股票多空 150 10 3
   • 量化精选股票多空 去创业板 150 10
   • 量化精选仓位计划 本金100万 150 10 3 风险1% 止损2ATR 分0.7
   • 量化精选仓位计划 本金50w 150 10 额均2亿 单票20% 最多5只
   • 短线选股 200 10
-  • 短线选股 去创业板 额2亿 200 10
+  • 短线选股 含创业板 额2亿 200 10
   • 短线选股 加资金流 200 10
   • 短线选股 加触发 200 10
   • 短线选股 加大盘 加触发 150 8
@@ -4087,12 +4184,15 @@ class FundAnalyzerPlugin(Star):
   • 短线批量分析 688981 加资金流
   • 短线批量分析 601398 601288 前15
   • 威科夫选股 200 10
-  • 威科夫选股 去创业板 额2亿 150 8
+  • 威科夫选股 含创业板 额2亿 150 8
   • 威科夫批量分析 600519 000001
   • 威科夫批量分析 601288 300750 前12
   • 量化精选基金 400 10
+  • 量化分析 161226
+  • 量化分析 161226 发图
   • 智能分析 161226
   • 股票智能分析 161226
+  • 股票智能分析 600519 发图
   • 基金历史 161226 20
   • 搜索基金 白银
 ━━━━━━━━━━━━━━━━━

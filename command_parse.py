@@ -19,12 +19,15 @@ MAX_BOARD_QUANT_MAX_SCAN = 200
 MIN_BOARD_QUANT_TOP = 1
 MAX_BOARD_QUANT_TOP = 50
 
-# 量化精选股票等：剔除北交所、创业板、科创板的关键词（可与数字任意混排）
+# 量化精选股票等：剔除/恢复北交所、创业板、科创板的关键词（可与数字任意混排；「去*」优先于「含*」）
 EXCLUDE_BEIJING_KEYWORDS = frozenset({"去北交所", "去北交"})
+INCLUDE_BEIJING_KEYWORDS = frozenset({"含北交所", "含北交"})
 EXCLUDE_CHINEXT_KEYWORDS = frozenset(
     {"去创业板", "去创", "去创业"}
 )
+INCLUDE_CHINEXT_KEYWORDS = frozenset({"含创业板", "含创", "含创业"})
 EXCLUDE_STAR_KEYWORDS = frozenset({"去科技", "去科创板", "去科创"})
+INCLUDE_STAR_KEYWORDS = frozenset({"含科技", "含科创板", "含科创"})
 # 仅「量化精选股票」使用 exclude_limit_up
 EXCLUDE_LIMIT_UP_KEYWORDS = frozenset({"去涨停", "剔涨停", "剔除涨停"})
 # 显式保留 ST；未写时默认剔除 *ST/ST（见 _pairs_for_short_term 等）
@@ -64,6 +67,35 @@ SHORT_TERM_WITH_TRIGGER_KEYWORDS = frozenset({
 DEFAULT_SHORT_TERM_BATCH_TOP = 20
 MIN_SHORT_TERM_BATCH_TOP = 1
 MAX_SHORT_TERM_BATCH_TOP = 50
+
+# 「股票智能分析」可选：报告图、详细阶段进度（与代码/场外标记任意混排）
+STOCK_SMART_ANALYSIS_IMAGE_KEYWORDS = frozenset({"发图", "出图", "要图", "图片"})
+STOCK_SMART_ANALYSIS_VERBOSE_PROGRESS_KEYWORDS = frozenset(
+    {"详进度", "详细进度", "显示进度"}
+)
+# 「量化精选股票」：默认纯文本；写「发图」等与上表一致才渲染报告图
+REPORT_IMAGE_KEYWORDS = STOCK_SMART_ANALYSIS_IMAGE_KEYWORDS
+
+
+def parse_stock_smart_analysis_tail(tail: str) -> tuple[str, bool, bool]:
+    """
+    解析「股票智能分析」尾部：分出 发图 / 详进度 关键词，其余拼接为代码段（可含场外、.OF 等）。
+    Returns:
+        (code_tail, want_image_report, want_verbose_progress)
+    """
+    parts = (tail or "").split()
+    want_image = False
+    want_verbose_progress = False
+    rest: list[str] = []
+    for p in parts:
+        if p in REPORT_IMAGE_KEYWORDS:
+            want_image = True
+        elif p in STOCK_SMART_ANALYSIS_VERBOSE_PROGRESS_KEYWORDS:
+            want_verbose_progress = True
+        else:
+            rest.append(p)
+    code_tail = " ".join(rest).strip()
+    return code_tail, want_image, want_verbose_progress
 
 
 def get_event_plain_text(event: Any) -> str:
@@ -175,15 +207,24 @@ def parse_name_maxscan_top(
 
 def split_exchange_exclude_keyword_tokens(
     tail: str,
+    *,
+    default_exclude_bse: bool = False,
+    default_exclude_chinext: bool = False,
+    default_exclude_star: bool = False,
 ) -> tuple[list[str], bool, bool, bool, bool, bool]:
     """分出剔除关键词与非关键词 token；最后一项为 include_st（用户要保留 ST）。"""
     parts = (tail or "").split()
-    exclude_bse = False
-    exclude_chinext = False
-    exclude_limit_up = False
-    exclude_star = False
-    include_st = False
-    rest: list[str] = []
+    exclude_bse = default_exclude_bse
+    exclude_chinext = default_exclude_chinext
+    exclude_star = default_exclude_star
+    # 先「含*」再「去*」，保证显式剔除覆盖显式包含
+    for p in parts:
+        if p in INCLUDE_BEIJING_KEYWORDS:
+            exclude_bse = False
+        elif p in INCLUDE_CHINEXT_KEYWORDS:
+            exclude_chinext = False
+        elif p in INCLUDE_STAR_KEYWORDS:
+            exclude_star = False
     for p in parts:
         if p in EXCLUDE_BEIJING_KEYWORDS:
             exclude_bse = True
@@ -191,12 +232,23 @@ def split_exchange_exclude_keyword_tokens(
             exclude_chinext = True
         elif p in EXCLUDE_STAR_KEYWORDS:
             exclude_star = True
-        elif p in EXCLUDE_LIMIT_UP_KEYWORDS:
+    exclude_limit_up = False
+    include_st = False
+    rest: list[str] = []
+    for p in parts:
+        if p in EXCLUDE_BEIJING_KEYWORDS or p in INCLUDE_BEIJING_KEYWORDS:
+            continue
+        if p in EXCLUDE_CHINEXT_KEYWORDS or p in INCLUDE_CHINEXT_KEYWORDS:
+            continue
+        if p in EXCLUDE_STAR_KEYWORDS or p in INCLUDE_STAR_KEYWORDS:
+            continue
+        if p in EXCLUDE_LIMIT_UP_KEYWORDS:
             exclude_limit_up = True
-        elif p in INCLUDE_ST_KEYWORDS:
+            continue
+        if p in INCLUDE_ST_KEYWORDS:
             include_st = True
-        else:
-            rest.append(p)
+            continue
+        rest.append(p)
     return rest, exclude_bse, exclude_chinext, exclude_limit_up, exclude_star, include_st
 
 
@@ -205,17 +257,32 @@ def parse_quant_stock_screen_tail(
     *,
     default_max_scan: int = DEFAULT_QUANT_STOCK_MAX_SCAN,
     default_top: int = DEFAULT_QUANT_STOCK_TOP,
-) -> tuple[int, int, bool, bool, bool, bool, bool]:
+) -> tuple[int, int, bool, bool, bool, bool, bool, bool]:
     """
-    解析「量化精选股票」尾部：可选 去北交所/去北交、去创业板/去创/去创业、去科技/去科创板/去科创、
-    去涨停/剔涨停/剔除涨停；默认剔除 *ST/ST，写「含ST」「带ST」「不去ST」「保留ST」则保留。
+    解析「量化精选股票」尾部：默认剔除北交所、创业板、科创板；可用 含北交/含创业板/含科技 等恢复；
+    仍可用 去北交、去创业板、去科技 等显式剔除（与同条中「含*」并存时「去*」优先）。
+    可选 去涨停/剔涨停/剔除涨停；默认剔除 *ST/ST，写「含ST」「带ST」「不去ST」「保留ST」则保留。
+    尾部可写 发图/出图/要图/图片，表示输出 HTML 报告图（默认仅文本）。
     前筛剔除涨跌幅>9%（不按板块区分幅度），及 1～2 个正整数。
     无数字时为 default_max_scan / default_top；一个数字视为 max_scan；两个依次为 max_scan、top_n。
     """
     rest, exclude_bse, exclude_chinext, exclude_limit_up, exclude_star, include_st = (
-        split_exchange_exclude_keyword_tokens(tail)
+        split_exchange_exclude_keyword_tokens(
+            tail,
+            default_exclude_bse=True,
+            default_exclude_chinext=True,
+            default_exclude_star=True,
+        )
     )
     exclude_st = not include_st
+    want_image = False
+    rest_wo_img: list[str] = []
+    for x in rest:
+        if x in REPORT_IMAGE_KEYWORDS:
+            want_image = True
+        else:
+            rest_wo_img.append(x)
+    rest = rest_wo_img
     nums: list[int] = []
     for x in rest:
         if x.isdigit():
@@ -239,6 +306,7 @@ def parse_quant_stock_screen_tail(
         exclude_limit_up,
         exclude_star,
         exclude_st,
+        want_image,
     )
 
 
@@ -250,12 +318,17 @@ def parse_quant_stock_screen_debate_tail(
     max_debate_cap: int = MAX_QUANT_STOCK_DEBATE_CAP,
 ) -> tuple[int, int, int, bool, bool, bool, bool, bool]:
     """
-    解析「量化精选股票多空」尾部：与「量化精选股票」相同的剔除关键词；
+    解析「量化精选股票多空」尾部：与「量化精选股票」相同的板块/涨停/ST 关键词与默认（默认剔北交所、创业板、科创板）。
     正整数可 1～3 个：依次为 max_scan、top_n、智能分析只数上限；
     第三个上限会与 top_n 及 max_debate_cap 取最小值；未写第三个时分析只数为 min(top_n, max_debate_cap)。
     """
     rest, exclude_bse, exclude_chinext, exclude_limit_up, exclude_star, include_st = (
-        split_exchange_exclude_keyword_tokens(tail)
+        split_exchange_exclude_keyword_tokens(
+            tail,
+            default_exclude_bse=True,
+            default_exclude_chinext=True,
+            default_exclude_star=True,
+        )
     )
     exclude_st = not include_st
     nums: list[int] = []
@@ -414,7 +487,7 @@ def parse_quant_stock_screen_position_tail(
     int | None,
 ]:
     """
-    解析「量化精选仓位计划」尾部：在「量化精选股票多空」筛参基础上，
+    解析「量化精选仓位计划」尾部：在「量化精选股票多空」筛参基础上（默认剔除北交所、创业板、科创板），
     增加本金 / 风险 / 止损ATR / 最低分 / 额均 / 单票上限 / 最多只数（均可选除本金外有默认值）。
     本金须出现一次：本金100万、本金50w、本金1000000。
     """
@@ -505,7 +578,7 @@ def parse_short_term_screen_tail(
     解析「短线选股」尾部参数。
 
     支持任意顺序的：
-    - 关键词剔除：去北交所/去创业板/去科创板/去涨停（与「量化精选股票」一致）；默认剔除 ST，「含ST」等保留
+    - 关键词剔除：与「量化精选股票」相同词表与默认（默认剔除北交所、创业板、科创板；可用 含北交/含创/含科技 等恢复；「去*」优先于「含*」）；另含去涨停；默认剔除 ST，「含ST」等保留
     - 成交额阈值：'额1亿' / '1.5亿' / '2亿额'（默认 1 亿，0 表示不过滤）
     - 资金流开关：'加资金流' / '含资金流' / '加主力' 等同义词
     - 盘面水温：'加大盘' / '大盘' / '上证' / '大盘水温'（拉上证指数并缩放总分）
@@ -518,7 +591,12 @@ def parse_short_term_screen_tail(
          with_market_regime, with_wyckoff_trigger)
     """
     rest, exclude_bse, exclude_chinext, exclude_limit_up, exclude_star, include_st = (
-        split_exchange_exclude_keyword_tokens(tail)
+        split_exchange_exclude_keyword_tokens(
+            tail,
+            default_exclude_bse=True,
+            default_exclude_chinext=True,
+            default_exclude_star=True,
+        )
     )
     exclude_st = not include_st
 
@@ -589,13 +667,18 @@ def parse_wyckoff_screen_tail(
     default_min_amount_yi: float = DEFAULT_SHORT_TERM_MIN_AMOUNT_YI,
 ) -> tuple[int, int, float, bool, bool, bool, bool, bool]:
     """
-    解析「威科夫选股」尾部：与「短线选股」相同，但不启用资金流关键词（出现则忽略）。
+    解析「威科夫选股」尾部：与「短线选股」相同（含板块默认剔除与含* 恢复），但不启用资金流关键词（出现则忽略）。
     Returns:
         (max_scan, top_n, min_amount_yi, exclude_bse, exclude_chinext,
          exclude_limit_up, exclude_star, exclude_st)
     """
     rest, exclude_bse, exclude_chinext, exclude_limit_up, exclude_star, include_st = (
-        split_exchange_exclude_keyword_tokens(tail)
+        split_exchange_exclude_keyword_tokens(
+            tail,
+            default_exclude_bse=True,
+            default_exclude_chinext=True,
+            default_exclude_star=True,
+        )
     )
     exclude_st = not include_st
 
