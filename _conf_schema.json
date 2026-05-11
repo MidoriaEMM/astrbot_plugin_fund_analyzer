@@ -1,8 +1,14 @@
 {
   "tickflow_api_key": {
-    "description": "Tickflow API Key（股票实时行情，完整服务）。留空则从环境变量 TICKFLOW_API_KEY 读取",
+    "description": "Tickflow API Key（股票实时）。留空则从环境变量 TICKFLOW_API_KEY 读取；在 Tushare 不可用时回退启用",
     "type": "text",
     "default": "",
     "hint": "在 tickflow.org 控制台生成；此处非空时优先于环境变量 TICKFLOW_API_KEY"
+  },
+  "tushare_token": {
+    "description": "Tushare Pro Token（日线/换手 pro_bar + 实时快照 rt_k）。留空则从环境变量 TUSHARE_TOKEN 读取",
+    "type": "text",
+    "default": "",
+    "hint": "tushare.pro 获取；配置了则优先用于 A 股快照/个股行情与场内基金日K；失败后回退 Tickflow→东财/AKShare"
   }
 }

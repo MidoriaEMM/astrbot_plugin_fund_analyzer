@@ -17,6 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from astrbot.api import logger
 
@@ -65,6 +66,27 @@ class DebateResult:
     stock_change_rate: float = 0.0
     total_llm_calls: int = 0
     total_time_seconds: float = 0.0
+    completed_at: datetime | None = None
+
+    def to_snapshot_dict(self, *, alignment: dict[str, Any] | None = None) -> dict[str, Any]:
+        """结构化快照（code、score、时间戳等），供仓位计划与 JSON 导出。"""
+        from .debate_score import debate_result_score_01
+
+        score = debate_result_score_01(self)
+        snap: dict[str, Any] = {
+            "code": self.stock_code,
+            "name": self.stock_name,
+            "score": score,
+            "completed_at": (
+                self.completed_at.isoformat() if self.completed_at else None
+            ),
+            "direction": self.final_direction,
+            "confidence": float(self.confidence),
+            "price": float(self.stock_price),
+        }
+        if alignment:
+            snap.update(alignment)
+        return snap
 
 
 class DebateEngine:
@@ -336,6 +358,7 @@ class DebateEngine:
         # 计算耗时
         elapsed = (datetime.now() - start_time).total_seconds()
         result.total_time_seconds = elapsed
+        result.completed_at = datetime.now(ZoneInfo("Asia/Shanghai"))
 
         if progress_callback:
             calls = result.total_llm_calls

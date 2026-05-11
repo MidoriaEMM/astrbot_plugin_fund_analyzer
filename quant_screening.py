@@ -15,7 +15,7 @@ from typing import Any, Optional
 from astrbot.api import logger
 
 from .ai_analyzer.quant import QuantAnalyzer
-from .stock.exchange_filter import should_exclude_a_share
+from .stock.exchange_filter import is_st_stock_name, should_exclude_a_share
 
 MIN_HISTORY_BARS = 20
 HISTORY_DAYS = 60
@@ -197,6 +197,7 @@ def _pandas_abs_change_pairs(
     exclude_chinext: bool = False,
     exclude_star: bool = False,
     exclude_limit_up: bool = False,
+    exclude_st: bool = True,
 ) -> list[tuple[str, str]]:
     import pandas as pd
 
@@ -238,6 +239,8 @@ def _pandas_abs_change_pairs(
         ):
             continue
         nm = str(row[name_col]) if name_col in dd.columns else ""
+        if exclude_st and is_st_stock_name(nm):
+            continue
         if exclude_limit_up:
             raw_pct = pd.to_numeric(row.get(rate_col), errors="coerce")
             pct_f = 0.0 if pd.isna(raw_pct) else float(raw_pct)
@@ -257,6 +260,7 @@ async def screen_stocks_by_abs_pct(
     exclude_chinext: bool = False,
     exclude_star: bool = False,
     exclude_limit_up: bool = False,
+    exclude_st: bool = True,
 ) -> tuple[list[ScreeningRow], int]:
     df = await stock_analyzer.get_a_share_spot_for_screening()
     if df is None or len(df) == 0:
@@ -268,6 +272,7 @@ async def screen_stocks_by_abs_pct(
         exclude_chinext=exclude_chinext,
         exclude_star=exclude_star,
         exclude_limit_up=exclude_limit_up,
+        exclude_st=exclude_st,
     )
     attempted = len(pairs)
     if not pairs:

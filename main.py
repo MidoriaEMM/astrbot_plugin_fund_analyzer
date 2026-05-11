@@ -7,8 +7,9 @@ AstrBot 基金数据分析插件
 import asyncio
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Optional
 
@@ -20,15 +21,20 @@ from astrbot.core.utils.t2i.renderer import HtmlRenderer
 # 导入股票分析模块
 from .stock import StockAnalyzer, StockInfo
 from .stock.exchange_filter import is_effectively_limit_up
-from .stock.day_trip import (
-    filter_spot_for_day_trip,
-    format_day_trip_report,
-    run_day_trip_full,
-)
 from .stock.short_term import (
+    SHORT_TERM_BATCH_MAX_CODES,
     SHORT_TERM_MIN_BARS,
+    batch_analyze_short_term_by_codes,
     format_short_term_report,
     screen_stocks_short_term,
+)
+from .stock.position_plan import build_position_plan, format_position_plan_table
+from .stock.wyckoff_screen import (
+    WYCKOFF_BATCH_MAX_CODES,
+    WYCKOFF_MIN_BARS,
+    batch_wyckoff_by_codes,
+    format_wyckoff_report,
+    screen_wyckoff_stocks,
 )
 from .stock.board_ak import (
     fetch_concept_cons,
@@ -42,14 +48,18 @@ from .stock.board_ak import (
 
 from .command_parse import (
     DEFAULT_BOARD_DISPLAY_LIMIT,
+    DEFAULT_SHORT_TERM_BATCH_TOP,
     MAX_QUANT_STOCK_DEBATE_CAP,
     get_event_plain_text,
-    parse_day_trip_tail,
     parse_keyword_and_limit,
     parse_name_maxscan_top,
     parse_quant_stock_screen_debate_tail,
+    parse_quant_stock_screen_position_tail,
     parse_quant_stock_screen_tail,
+    parse_short_term_batch_tail,
     parse_short_term_screen_tail,
+    parse_wyckoff_batch_tail,
+    parse_wyckoff_screen_tail,
     strip_command_prefix,
 )
 
@@ -236,6 +246,110 @@ class FundAnalyzer:
             logger.error(f"获取LOF基金历史行情失败: {e}")
             return None
 
+    #: 上证指数（东财 secid；勿用六位代码走普通行情以免误判深市）
+    SSE_INDEX_SECID = "1.000001"
+
+    async def get_sse_index_history(
+        self,
+        days: int = 60,
+        adjust: str = "qfq",
+        *,
+        kline_max_retries: int = 1,
+    ) -> list[dict] | None:
+        """
+        上证指数日 K（威科夫/短线「大盘水温」）。
+        优先级：Tushare ``index_daily`` → TickFlow 日 K ``000001.SH`` → 东财 ``secid=1.000001``。
+        """
+        d_need = max(int(days), 1)
+        min_required = min(d_need, 5)
+
+        ts_tok = self._api._effective_tushare_token()
+        if ts_tok:
+            try:
+                from .tushare_client import fetch_sse_index_daily_as_eastmoney_history
+
+                hist = await asyncio.to_thread(
+                    fetch_sse_index_daily_as_eastmoney_history,
+                    ts_tok,
+                    days,
+                    adjust,
+                )
+                if hist and len(hist) >= min_required:
+                    logger.info(
+                        f"上证指数日K 优先 Tushare（大盘水温）: {len(hist)} 条"
+                    )
+                    return hist
+            except Exception as e:
+                logger.debug(f"Tushare 上证日K 失败，尝试 Tickflow/东财: {e}")
+
+        tf_key = self._api._effective_tickflow_key()
+        if tf_key:
+            try:
+                from .tickflow_client.index_klines import (
+                    fetch_sse_index_daily_as_eastmoney_history as _fetch_sse_tf,
+                )
+
+                hist = await asyncio.to_thread(
+                    _fetch_sse_tf,
+                    tf_key,
+                    days,
+                    adjust,
+                )
+                if hist and len(hist) >= min_required:
+                    logger.info(
+                        f"上证指数日K Tickflow 000001.SH（大盘水温）: {len(hist)} 条"
+                    )
+                    return hist
+            except Exception as e:
+                logger.debug(f"Tickflow 上证日K 失败，回退东财: {e}")
+
+        try:
+            hist = await self._api.get_kline_history_by_secid(
+                self.SSE_INDEX_SECID,
+                days,
+                adjust,
+                max_retries=kline_max_retries,
+            )
+            if hist:
+                logger.debug(
+                    f"上证指数日K 东财 secid（大盘水温）: {len(hist)} 条"
+                )
+            return hist
+        except Exception as e:
+            logger.debug(f"上证指数 K 线失败: {e}")
+            return None
+
+    async def get_cn_equity_a_breadth(self) -> dict[str, Any] | None:
+        """
+        A 股涨跌广度（与全市场快照列对齐）。
+        优先级：Tushare ``rt_k`` → Tickflow ``CN_Equity_A``；失败返回 ``None``。
+        """
+        ts_tok = self._api._effective_tushare_token()
+        if ts_tok:
+            try:
+                from .tushare_client.breadth import fetch_cn_equity_a_breadth as _ts_breadth
+
+                b = await asyncio.to_thread(_ts_breadth, ts_tok)
+                if b and int(b.get("valid") or 0) > 0:
+                    logger.info("A股涨跌广度 优先 Tushare rt_k")
+                    return b
+            except Exception as e:
+                logger.debug(f"Tushare 涨跌广度失败: {e}")
+
+        tf_key = self._api._effective_tickflow_key()
+        if tf_key:
+            try:
+                from .tickflow_client.breadth import fetch_cn_equity_a_breadth as _tf_breadth
+
+                b = await asyncio.to_thread(_tf_breadth, tf_key)
+                if b and int(b.get("valid") or 0) > 0:
+                    logger.info("A股涨跌广度 Tickflow CN_Equity_A")
+                    return b
+            except Exception as e:
+                logger.debug(f"Tickflow 涨跌广度失败: {e}")
+
+        return None
+
     async def search_fund(self, keyword: str) -> list[dict]:
         """
         搜索LOF基金
@@ -322,11 +436,15 @@ class FundAnalyzerPlugin(Star):
         super().__init__(context)
         self.analyzer = FundAnalyzer()
         tf_key = (config.get("tickflow_api_key") or "").strip()
-        # 配置为空传 None，以便 StockAnalyzer 回退读取 TICKFLOW_API_KEY
+        ts_token = (config.get("tushare_token") or "").strip()
+        # 配置项为空传 None，以便回退读取环境变量 TICKFLOW_API_KEY / TUSHARE_TOKEN
         self.stock_analyzer = StockAnalyzer(
-            tickflow_api_key=tf_key if tf_key else None
+            tickflow_api_key=tf_key if tf_key else None,
+            tushare_token=ts_token if ts_token else None,
         )
-        get_eastmoney_api().set_tickflow_api_key(tf_key if tf_key else None)
+        em = get_eastmoney_api()
+        em.set_tickflow_api_key(tf_key if tf_key else None)
+        em.set_tushare_token(ts_token if ts_token else None)
         # 初始化图片渲染器
         self.image_renderer = HtmlRenderer()
         # 是否使用本地图片生成器（优先使用）
@@ -2207,15 +2325,15 @@ class FundAnalyzerPlugin(Star):
     ):
         """
         从 A 股全市场行情中按 |涨跌幅| 取前 N 只，逐只拉日线并量化排序。
-        用法: 量化精选股票 [候选只数] [输出条数] [去北交所] [去创业板] [去科技/去科创板/去科创] [去涨停/剔涨停/剔除涨停]
+        用法: 量化精选股票 [候选只数] [输出条数] [去北交所] [去创业板] [去科技/去科创板/去科创] [去涨停/剔涨停/剔除涨停] [含ST 可选]
         关键词可与数字任意顺序；默认候选150只、输出10条；不写关键词则全市场；不写「去科技」则含科创板；
-        「去涨停」类：前筛剔除当日涨跌幅>9%（不按板块区分涨跌停幅度）；默认不写则不剔除。
+        「去涨停」类：前筛剔除当日涨跌幅>9%（不按板块区分涨跌停幅度）；默认剔除 *ST/ST 风险警示股，写「含ST」「带ST」「不去ST」「保留ST」则保留。
         """
         try:
             tail = strip_command_prefix(
                 get_event_plain_text(event), "量化精选股票"
             )
-            max_scan, top_n, exclude_bse, exclude_chinext, exclude_limit_up, exclude_star = (
+            max_scan, top_n, exclude_bse, exclude_chinext, exclude_limit_up, exclude_star, exclude_st = (
                 parse_quant_stock_screen_tail(tail)
             )
             ex_notes: list[str] = []
@@ -2227,11 +2345,15 @@ class FundAnalyzerPlugin(Star):
                 ex_notes.append("科创板")
             if exclude_limit_up:
                 ex_notes.append("涨>9%")
+            if exclude_st:
+                ex_notes.append("*ST/ST")
             ex_suffix = (
                 "，剔除：" + "、".join(ex_notes)
                 if ex_notes
                 else "（全市场）"
             )
+            if not exclude_st:
+                ex_suffix += "；含风险警示股"
 
             yield event.plain_result(
                 f"📊 量化精选股票{ex_suffix}：按 |涨跌幅| 取前 {max_scan} 只拉取60日K线，"
@@ -2247,6 +2369,7 @@ class FundAnalyzerPlugin(Star):
                 exclude_chinext=exclude_chinext,
                 exclude_star=exclude_star,
                 exclude_limit_up=exclude_limit_up,
+                exclude_st=exclude_st,
             )
             if attempted == 0:
                 yield event.plain_result(
@@ -2307,6 +2430,7 @@ class FundAnalyzerPlugin(Star):
                 exclude_chinext,
                 exclude_limit_up,
                 exclude_star,
+                exclude_st,
             ) = parse_quant_stock_screen_debate_tail(tail)
 
             ex_notes: list[str] = []
@@ -2318,11 +2442,15 @@ class FundAnalyzerPlugin(Star):
                 ex_notes.append("科创板")
             if exclude_limit_up:
                 ex_notes.append("涨>9%")
+            if exclude_st:
+                ex_notes.append("*ST/ST")
             ex_suffix = (
                 "，剔除：" + "、".join(ex_notes)
                 if ex_notes
                 else "（全市场）"
             )
+            if not exclude_st:
+                ex_suffix += "；含风险警示股"
 
             yield event.plain_result(
                 f"⚖️ 量化精选股票多空{ex_suffix}：候选至多 {max_scan} 只 → TOP {top_n} → "
@@ -2340,6 +2468,7 @@ class FundAnalyzerPlugin(Star):
                 exclude_chinext=exclude_chinext,
                 exclude_star=exclude_star,
                 exclude_limit_up=exclude_limit_up,
+                exclude_st=exclude_st,
             )
             if attempted == 0:
                 yield event.plain_result(
@@ -2384,7 +2513,7 @@ class FundAnalyzerPlugin(Star):
                     )
                     continue
 
-                debate_result, _info, err = await self._run_debate_pipeline_for_code(
+                debate_result, _info, err, _align = await self._run_debate_pipeline_for_code(
                     row.code,
                     False,
                     progress_callback=None,
@@ -2418,15 +2547,50 @@ class FundAnalyzerPlugin(Star):
             logger.error(f"量化精选股票多空出错: {e}")
             yield event.plain_result(f"❌ 执行失败: {e}")
 
-    @filter.command("股票一日游")
-    async def stock_day_trip(self, event: AstrMessageEvent, top_arg: str = ""):
+    @filter.command("量化精选仓位计划")
+    async def quant_screen_stocks_position_plan(self, event: AstrMessageEvent):
         """
-        涨跌幅 3%~9% 且量比>1.5（无量比列时用成交量自建近似）→ 日线综合分前 20% → 分时 VWAP/尾盘急拉/触板回落。
-        用法: 股票一日游 [展示条数] [去北交所] [去创业板] [去科技/去科创板/去科创]，默认展示 15（最大50）；不写关键词则全市场。
+        与「量化精选股票多空」同源筛股与辩论；额外解析本金与风控参数，输出结构化快照与日 K 对齐指标，
+        并按 score 加权给出整手仓位演示（不构成投资建议）。
+        用法示例：量化精选仓位计划 本金100万 150 10 3 风险1% 止损2ATR 分0.7 额均2亿 单票20% 最多5只 去涨停
         """
         try:
-            tail = strip_command_prefix(get_event_plain_text(event), "股票一日游")
-            top_n, exclude_bse, exclude_chinext, exclude_star = parse_day_trip_tail(tail)
+            if not self.context.get_using_provider():
+                yield event.plain_result(
+                    "❌ 未配置大模型提供商\n"
+                    "💡 请在 AstrBot 管理面板配置 LLM 提供商后再试"
+                )
+                return
+
+            tail = strip_command_prefix(
+                get_event_plain_text(event), "量化精选仓位计划"
+            )
+            (
+                max_scan,
+                top_n,
+                debate_cap,
+                exclude_bse,
+                exclude_chinext,
+                exclude_limit_up,
+                exclude_star,
+                exclude_st,
+                principal,
+                risk_fraction,
+                k_atr,
+                min_score_01,
+                min_avg_amount_yi,
+                single_cap_fraction,
+                max_positions,
+            ) = parse_quant_stock_screen_position_tail(tail)
+
+            if principal is None or principal <= 0:
+                yield event.plain_result(
+                    "❌ 请在尾部指定本金，例如：本金100万、本金50w、本金1000000（元）\n"
+                    "💡 可选：风险1% 或 风险0.01 | 止损2ATR | 分0.7 | 额均2亿 | 单票20% | 最多5只\n"
+                    "（其余数字与剔除关键词与「量化精选股票多空」相同）"
+                )
+                return
+
             ex_notes: list[str] = []
             if exclude_bse:
                 ex_notes.append("北交所")
@@ -2434,82 +2598,186 @@ class FundAnalyzerPlugin(Star):
                 ex_notes.append("创业板")
             if exclude_star:
                 ex_notes.append("科创板")
+            if exclude_limit_up:
+                ex_notes.append("涨>9%")
+            if exclude_st:
+                ex_notes.append("*ST/ST")
             ex_suffix = (
                 "，剔除：" + "、".join(ex_notes)
                 if ex_notes
                 else "（全市场）"
             )
+            if not exclude_st:
+                ex_suffix += "；含风险警示股"
 
             yield event.plain_result(
-                f"📊 股票一日游{ex_suffix}：快照硬筛（涨跌幅 3%~9%、量比>1.5；"
-                "无量比列时用成交量自建近似）"
-                "→ 日线综合分前 20% → 分时验证…\n"
-                "⏳ 正在获取全市场 A 股行情…"
+                f"📐 量化精选仓位计划{ex_suffix}\n"
+                f"本金={principal:.2f} 组合风险={risk_fraction:.4f} "
+                f"k_ATR={k_atr} 最低分={min_score_01} "
+                f"额均≥{min_avg_amount_yi}亿 单票上限={single_cap_fraction:.2%}"
+                f"{'' if max_positions is None else f' 最多{max_positions}只'}\n"
+                f"候选至多 {max_scan} → TOP {top_n} → 辩论前 {debate_cap} 只（每只约 9 次 LLM）。"
+                f"涨停跳过 LLM。\n"
+                "每条形如：代码 名称 dir=… score=… bar=… atr=… 额均=… ts=…"
             )
 
-            df = await self.stock_analyzer._get_stock_data()
-
-            pairs, meta, vr_approx = filter_spot_for_day_trip(
-                df,
+            raw, attempted = await screen_stocks_by_abs_pct(
+                self.stock_analyzer,
+                self.analyzer,
+                max_scan=max_scan,
+                max_concurrent=DEFAULT_SCREENING_CONCURRENCY,
                 exclude_bse=exclude_bse,
                 exclude_chinext=exclude_chinext,
                 exclude_star=exclude_star,
+                exclude_limit_up=exclude_limit_up,
+                exclude_st=exclude_st,
             )
-            if not pairs:
-                approx_hint = ""
-                if vr_approx:
-                    approx_hint = (
-                        "\n💡 已用成交量中位数自建近似量比筛选用，"
-                        "非行情软件原生量比。"
+            if attempted == 0:
+                yield event.plain_result(
+                    "⚠️ 未得到行情候选（需 akshare 或涨跌幅/代码列缺失），"
+                    "请检查网络或缩小 max_scan。"
+                )
+                return
+            ranked = rank_screening_rows(raw)
+            top_rows = ranked[:top_n]
+
+            if not raw:
+                yield event.plain_result(
+                    f"⚠️ 已对 {attempted} 只拉取日线，均无足够 K 线样本（<{MIN_HISTORY_BARS} 根），无法排序。"
+                    + DISCLAIMER
+                )
+                return
+
+            targets = top_rows[:debate_cap]
+            if not targets:
+                yield event.plain_result(
+                    "⚠️ 排序结果为空，无法执行辩论。" + DISCLAIMER
+                )
+                return
+
+            self.stock_analyzer.invalidate_stock_cache()
+
+            ok_n = 0
+            fail_n = 0
+            skip_zt_n = 0
+            snapshots_ok: list[dict[str, Any]] = []
+            dir_ok = frozenset({"看涨", "看跌", "中性"})
+            for row in targets:
+                rt = await self.stock_analyzer.get_stock_realtime(row.code)
+                pct_txt = (
+                    f"（当前 {rt.change_rate:+.2f}%）" if rt is not None else ""
+                )
+                if rt is not None and is_effectively_limit_up(
+                    rt.code, rt.name, rt.change_rate
+                ):
+                    skip_zt_n += 1
+                    yield event.plain_result(
+                        f"{row.code} {row.name} 涨停{pct_txt}"
                     )
-                yield event.plain_result(
-                    "⚠️ 硬筛无符合条件的标的（3%~9%、量比>1.5、排除无量/B 股）。"
-                    f"{approx_hint}\n"
-                    + DISCLAIMER
+                    continue
+
+                debate_result, _info, err, alignment = (
+                    await self._run_debate_pipeline_for_code(
+                        row.code,
+                        False,
+                        progress_callback=None,
+                        with_alignment=True,
+                    )
                 )
-                return
+                if err:
+                    fail_n += 1
+                    short = (err.strip().split("\n") or [err])[0].strip()
+                    yield event.plain_result(
+                        f"{row.code} {row.name} 失败：{short}{pct_txt}"
+                    )
+                else:
+                    ok_n += 1
+                    d = debate_result.final_direction
+                    label = d if d in dir_ok else "中性"
+                    align_dict = (
+                        alignment.as_alignment_dict()
+                        if alignment is not None
+                        else {}
+                    )
+                    snap = debate_result.to_snapshot_dict(
+                        alignment=align_dict if align_dict else None
+                    )
+                    if rt is not None:
+                        lp = float(getattr(rt, "latest_price", 0.0) or 0.0)
+                        if lp > 0:
+                            snap["price"] = lp
+                    snapshots_ok.append(snap)
+                    atr_txt = (
+                        f"{align_dict['atr14']:.4f}"
+                        if align_dict.get("atr14") is not None
+                        else "-"
+                    )
+                    avg_txt = (
+                        f"{align_dict['avg_amount_5d_yi']:.4f}"
+                        if align_dict.get("avg_amount_5d_yi") is not None
+                        else "-"
+                    )
+                    bar_txt = align_dict.get("last_bar_date") or "-"
+                    ts_txt = snap.get("completed_at") or "-"
+                    sc = snap.get("score", 0.0)
+                    yield event.plain_result(
+                        f"{row.code} {row.name} dir={label}{pct_txt} "
+                        f"score={sc:.3f} bar={bar_txt} atr={atr_txt} "
+                        f"额均={avg_txt}亿 ts={ts_txt}"
+                    )
+
+            plan = build_position_plan(
+                principal,
+                risk_fraction,
+                k_atr,
+                min_score_01=min_score_01,
+                min_avg_amount_yi=min_avg_amount_yi,
+                single_cap_fraction=single_cap_fraction,
+                max_positions=max_positions,
+                snapshots=snapshots_ok,
+            )
+
+            yield event.plain_result(format_position_plan_table(plan))
+            if plan.warnings:
+                yield event.plain_result(
+                    "【配比说明 / 跳过原因】\n" + "\n".join(plan.warnings)
+                )
+
+            batch_at = datetime.now(ZoneInfo("Asia/Shanghai")).isoformat()
+            payload = {
+                "completed_batch_at": batch_at,
+                "principal": principal,
+                "risk_fraction": risk_fraction,
+                "k_atr": k_atr,
+                "min_score_01": min_score_01,
+                "min_avg_amount_yi": min_avg_amount_yi,
+                "single_cap_fraction": single_cap_fraction,
+                "max_positions": max_positions,
+                "snapshots": snapshots_ok,
+                "plan_rows": [asdict(r) for r in plan.rows],
+                "warnings": plan.warnings,
+                "total_notional": plan.total_notional,
+            }
+            yield event.plain_result(
+                "```json\n"
+                + json.dumps(payload, ensure_ascii=False, indent=2)
+                + "\n```"
+            )
 
             yield event.plain_result(
-                f"📊 硬筛 {len(pairs)} 只 → 正拉取 60 日 K 线量化（耗时可较长）…"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"辩论完成：成功 {ok_n} 条，失败 {fail_n} 条"
+                f"{'' if skip_zt_n == 0 else f'，跳过涨停 {skip_zt_n} 条'}。\n"
+                "⚠️ A 股整手、T+1、涨跌停及成交不确定性未建模；以下为演示用配比。\n"
+                f"{DISCLAIMER.strip()}"
             )
 
-            lines, stats = await run_day_trip_full(
-                self.analyzer,
-                pairs,
-                meta,
-                max_concurrent_screen=DEFAULT_SCREENING_CONCURRENCY,
-            )
-
-            if stats.get("k_valid", 0) == 0:
-                yield event.plain_result(
-                    f"⚠️ 已对 {len(pairs)} 只拉取日线，均无足够 K 线样本（<{MIN_HISTORY_BARS} 根）。"
-                    + DISCLAIMER
-                )
-                return
-
-            trunc = ""
-            if len(lines) > top_n:
-                trunc = f"💡 仅展示前 {top_n} 条（分时通过共 {stats['minute_pass']} 只）。\n"
-
-            text = format_day_trip_report(
-                lines[:top_n],
-                hard_n=stats["hard_n"],
-                k_valid=stats["k_valid"],
-                top_pool=stats["top_pool"],
-                minute_pass=stats["minute_pass"],
-                trade_date=str(stats.get("trade_date", "")),
-                truncation_note=trunc,
-                volume_ratio_is_approx=vr_approx,
-                minute_fail_counts=stats.get("minute_fail_counts") or {},
-            )
-            yield event.plain_result(text)
-        except ImportError as e:
+        except ImportError:
             yield event.plain_result(
-                "❌ 需要 akshare\n请执行: pip install akshare"
+                "❌ 需要 akshare 拉取 A 股行情\n请执行: pip install akshare"
             )
-            logger.debug("股票一日游 ImportError: %s", e)
         except Exception as e:
-            logger.error(f"股票一日游出错: {e}")
+            logger.error(f"量化精选仓位计划出错: {e}")
             yield event.plain_result(f"❌ 执行失败: {e}")
 
     @filter.command("短线选股")
@@ -2521,11 +2789,11 @@ class FundAnalyzerPlugin(Star):
     ):
         """
         基于量价因子的 1-3 日短线选股：动量 + 量能突破 + 量价共振 + 换手情绪 + 蓄势/位置 + 短期反弹。
-        可选启用「主力资金流向」因子（耗时 +30~50%）。
-        用法: 短线选股 [候选数] [输出条数] [额X亿] [加资金流] [去北交所] [去创业板] [去科技/去科创板/去科创] [去涨停]
+        可选「加资金流」「加大盘」「加触发」（详见尾部关键词）。
+        用法: 短线选股 [候选数] [输出条数] [额X亿] [加资金流] [加大盘] [加触发] [去北交所] …
+        默认剔除 *ST/ST；「含ST」「带ST」「不去ST」「保留ST」可保留风险警示股。
         关键词与数字可任意顺序；默认候选 200、输出 10、最小日成交额 1 亿；
-        '额2亿' / '1.5亿' 调成交额阈值（0 亿不过滤）；
-        '加资金流' / '含主力' 启用主力流向因子（顶部派发/底部吸筹/主散对冲）。
+        「加大盘」拉上证指数并按档位温和缩放总分；「加触发」展示威科夫主触发并小额加减分。
         """
         try:
             tail = strip_command_prefix(get_event_plain_text(event), "短线选股")
@@ -2537,7 +2805,10 @@ class FundAnalyzerPlugin(Star):
                 exclude_chinext,
                 exclude_limit_up,
                 exclude_star,
+                exclude_st,
                 with_fund_flow,
+                with_market_regime,
+                with_wyckoff_trigger,
             ) = parse_short_term_screen_tail(tail)
 
             ex_notes: list[str] = []
@@ -2549,36 +2820,55 @@ class FundAnalyzerPlugin(Star):
                 ex_notes.append("科创板")
             if exclude_limit_up:
                 ex_notes.append("涨>9%")
+            if exclude_st:
+                ex_notes.append("*ST/ST")
             ex_suffix = (
                 "，剔除：" + "、".join(ex_notes)
                 if ex_notes
                 else "（全市场）"
             )
+            if not exclude_st:
+                ex_suffix += "；含风险警示股"
 
             flow_notice = ""
             time_hint = "约数分钟"
             if with_fund_flow:
                 flow_notice = " + 主力流向（顶部派发/底部吸筹/主散对冲）"
                 time_hint = "约 5~7 分钟（含主力流向）"
+            opt_bits: list[str] = []
+            if with_market_regime:
+                opt_bits.append("上证水温缩放总分")
+            if with_wyckoff_trigger:
+                opt_bits.append("威科夫触发列与小加分")
+            opt_txt = ""
+            if opt_bits:
+                opt_txt = "；" + "、".join(opt_bits)
+                if not with_fund_flow:
+                    time_hint = "约数分钟（略增解析）"
 
             yield event.plain_result(
                 f"🎯 短线选股{ex_suffix}：按 |涨跌幅| 取候选 {max_scan} 只"
                 f"（成交额≥{min_amount_yi}亿），输出 TOP {top_n}\n"
-                f"因子：动量 + 量能 + 量价共振 + 换手情绪 + 蓄势/位置 + 短期RSI{flow_notice}\n"
+                f"因子：动量 + 量能 + 量价共振 + 换手情绪 + 蓄势/位置 + 短期RSI{flow_notice}{opt_txt}\n"
                 f"⏳ 正在拉取全市场行情与 60 日 K 线（{time_hint}）…"
             )
 
-            lines, attempted, valid, with_flow_n = await screen_stocks_short_term(
-                self.stock_analyzer,
-                self.analyzer,
-                max_scan=max_scan,
-                min_amount_yi=min_amount_yi,
-                max_concurrent=DEFAULT_SCREENING_CONCURRENCY,
-                exclude_bse=exclude_bse,
-                exclude_chinext=exclude_chinext,
-                exclude_star=exclude_star,
-                exclude_limit_up=exclude_limit_up,
-                with_fund_flow=with_fund_flow,
+            lines, attempted, valid, with_flow_n, regime_snap = (
+                await screen_stocks_short_term(
+                    self.stock_analyzer,
+                    self.analyzer,
+                    max_scan=max_scan,
+                    min_amount_yi=min_amount_yi,
+                    max_concurrent=DEFAULT_SCREENING_CONCURRENCY,
+                    exclude_bse=exclude_bse,
+                    exclude_chinext=exclude_chinext,
+                    exclude_star=exclude_star,
+                    exclude_limit_up=exclude_limit_up,
+                    exclude_st=exclude_st,
+                    with_fund_flow=with_fund_flow,
+                    with_market_regime=with_market_regime,
+                    with_wyckoff_trigger=with_wyckoff_trigger,
+                )
             )
             if attempted == 0:
                 yield event.plain_result(
@@ -2598,6 +2888,17 @@ class FundAnalyzerPlugin(Star):
             if len(lines) > top_n:
                 trunc = f"💡 共 {len(lines)} 只入榜，仅展示前 {top_n}。\n"
 
+            extra_pool = ""
+            if regime_snap is not None:
+                lab = str(getattr(regime_snap, "label", "") or "")
+                att = str(getattr(regime_snap, "attitude", "") or "")
+                extra_pool = f"上证盘面: {lab} — {att}\n"
+                nlist = getattr(regime_snap, "notes", None) or []
+                if nlist:
+                    extra_pool += "  · " + "\n  · ".join(
+                        str(x) for x in nlist[:4]
+                    ) + "\n"
+
             text = format_short_term_report(
                 lines[:top_n],
                 candidate_count=attempted,
@@ -2606,6 +2907,8 @@ class FundAnalyzerPlugin(Star):
                 min_amount_yi=min_amount_yi,
                 with_fund_flow=with_fund_flow,
                 fund_flow_count=with_flow_n,
+                extra_pool_lines=extra_pool,
+                with_wyckoff_trigger=with_wyckoff_trigger,
             )
             yield event.plain_result(text)
         except ImportError as e:
@@ -2615,6 +2918,298 @@ class FundAnalyzerPlugin(Star):
             logger.debug("短线选股 ImportError: %s", e)
         except Exception as e:
             logger.error(f"短线选股出错: {e}")
+            yield event.plain_result(f"❌ 执行失败: {e}")
+
+    @filter.command("短线批量分析")
+    async def stock_short_term_batch(self, event: AstrMessageEvent):
+        """
+        对指定多只 A 股复用「短线选股」同源因子与打分，批量输出报告。
+        用法: 短线批量分析 <代码…> [加资金流] [加大盘] [加触发] [展示条数1-50｜前N]
+        单次最多分析的只数见 SHORT_TERM_BATCH_MAX_CODES。
+        """
+        try:
+            tail = strip_command_prefix(get_event_plain_text(event), "短线批量分析")
+            (
+                codes,
+                with_fund_flow,
+                top_show,
+                with_market_regime,
+                with_wyckoff_trigger,
+            ) = parse_short_term_batch_tail(tail)
+            if not codes:
+                yield event.plain_result(
+                    "用法: 短线批量分析 <代码1> [代码2] … [加资金流｜含主力] [加大盘] [加触发] [展示条数]\n"
+                    "• 同源因子：短线选股的量价评分（1-3 日视角）\n"
+                    "• 可加「加资金流」启用主力流向\n"
+                    "• 「加大盘」「加触发」与短线选股尾部语义一致\n"
+                    "• 末尾 1～50 的数字或「前N」为展示条数（默认 "
+                    f"{DEFAULT_SHORT_TERM_BATCH_TOP}）\n"
+                    "示例:\n"
+                    "  短线批量分析 600519 000001 300750\n"
+                    "  短线批量分析 688981 加资金流\n"
+                    "  短线批量分析 601398 601288 加大盘 加触发 15\n"
+                    + DISCLAIMER
+                )
+                return
+
+            trunc_head = ""
+            if len(codes) > SHORT_TERM_BATCH_MAX_CODES:
+                codes = codes[:SHORT_TERM_BATCH_MAX_CODES]
+                trunc_head = (
+                    f"⚠️ 单次最多分析 {SHORT_TERM_BATCH_MAX_CODES} 只，已截断多余代码。\n"
+                )
+
+            flow_notice = ""
+            time_hint = "约 1~3 分钟"
+            if with_fund_flow:
+                flow_notice = " + 主力流向"
+                time_hint = "约 2~5 分钟（含主力流向）"
+            opt_bits: list[str] = []
+            if with_market_regime:
+                opt_bits.append("上证水温")
+            if with_wyckoff_trigger:
+                opt_bits.append("威科夫触发")
+            if opt_bits:
+                flow_notice += " +" + "+".join(opt_bits)
+
+            yield event.plain_result(
+                trunc_head
+                + f"🎯 短线批量分析：共 {len(codes)} 只（同源因子）{flow_notice}\n"
+                + f"⏳ 正在解析名称并拉取 60 日 K 线…（{time_hint}）"
+            )
+
+            lines, attempted, valid, with_flow_n, regime_snap = (
+                await batch_analyze_short_term_by_codes(
+                    self.stock_analyzer,
+                    self.analyzer,
+                    codes,
+                    max_concurrent=DEFAULT_SCREENING_CONCURRENCY,
+                    with_fund_flow=with_fund_flow,
+                    with_market_regime=with_market_regime,
+                    with_wyckoff_trigger=with_wyckoff_trigger,
+                )
+            )
+
+            if valid == 0:
+                yield event.plain_result(
+                    f"⚠️ 已对 {attempted} 只拉取日线，均无足够 K 线样本"
+                    f"（<{SHORT_TERM_MIN_BARS} 根），无法计算量价因子。"
+                    + DISCLAIMER
+                )
+                return
+
+            trunc_note = ""
+            if len(lines) > top_show:
+                trunc_note = (
+                    f"💡 共 {len(lines)} 只入榜，仅展示前 {top_show} 条。\n"
+                )
+
+            extra_pool = ""
+            if regime_snap is not None:
+                lab = str(getattr(regime_snap, "label", "") or "")
+                att = str(getattr(regime_snap, "attitude", "") or "")
+                extra_pool = f"上证盘面: {lab} — {att}\n"
+                nlist = getattr(regime_snap, "notes", None) or []
+                if nlist:
+                    extra_pool += "  · " + "\n  · ".join(
+                        str(x) for x in nlist[:4]
+                    ) + "\n"
+
+            text = format_short_term_report(
+                lines[:top_show],
+                title="🎯 短线批量分析（同源因子）",
+                candidate_count=attempted,
+                valid_count=valid,
+                truncation_note=trunc_note,
+                min_amount_yi=0.0,
+                with_fund_flow=with_fund_flow,
+                fund_flow_count=with_flow_n,
+                batch_mode=True,
+                extra_pool_lines=extra_pool,
+                with_wyckoff_trigger=with_wyckoff_trigger,
+            )
+            yield event.plain_result(text)
+        except ImportError as e:
+            yield event.plain_result(
+                "❌ 需要 akshare 等依赖拉取行情\n请执行: pip install akshare"
+            )
+            logger.debug("短线批量分析 ImportError: %s", e)
+        except Exception as e:
+            logger.error(f"短线批量分析出错: {e}")
+            yield event.plain_result(f"❌ 执行失败: {e}")
+
+    @filter.command("威科夫选股")
+    async def stock_wyckoff_screen(self, event: AstrMessageEvent):
+        """
+        威科夫启发式七维打分（大盘/阶段/触发/量价/均线/赔率/仓位），与「短线选股」候选规则相近但因子独立。
+        用法: 威科夫选股 [候选数] [输出条数] [额X亿] [去北交所] [去创业板/去创/去创业] [去科技/去科创] [去涨停] [含ST 可选]
+        默认剔除 *ST/ST；「含ST」等同理可保留风险警示股。
+        （不支持「加资金流」）
+        """
+        try:
+            tail = strip_command_prefix(get_event_plain_text(event), "威科夫选股")
+            (
+                max_scan,
+                top_n,
+                min_amount_yi,
+                exclude_bse,
+                exclude_chinext,
+                exclude_limit_up,
+                exclude_star,
+                exclude_st,
+            ) = parse_wyckoff_screen_tail(tail)
+
+            ex_notes: list[str] = []
+            if exclude_bse:
+                ex_notes.append("北交所")
+            if exclude_chinext:
+                ex_notes.append("创业板")
+            if exclude_star:
+                ex_notes.append("科创板")
+            if exclude_limit_up:
+                ex_notes.append("涨>9%")
+            if exclude_st:
+                ex_notes.append("*ST/ST")
+            ex_suffix = (
+                "，剔除：" + "、".join(ex_notes) if ex_notes else "（全市场）"
+            )
+            if not exclude_st:
+                ex_suffix += "；含风险警示股"
+
+            yield event.plain_result(
+                f"📐 威科夫选股{ex_suffix}：按 |涨跌幅| 候选 {max_scan} 只"
+                f"（成交额≥{min_amount_yi}亿），输出 TOP {top_n}\n"
+                "维度：上证盘面 + 阶段近似 + Spring/SOS/LPS… + 量价 + 均线 + R:R + 仓位建议\n"
+                "⏳ 正在拉取上证指数与个股 60 日 K 线…"
+            )
+
+            lines, regime, attempted, valid = await screen_wyckoff_stocks(
+                self.stock_analyzer,
+                self.analyzer,
+                max_scan=max_scan,
+                min_amount_yi=min_amount_yi,
+                max_concurrent=DEFAULT_SCREENING_CONCURRENCY,
+                exclude_bse=exclude_bse,
+                exclude_chinext=exclude_chinext,
+                exclude_star=exclude_star,
+                exclude_limit_up=exclude_limit_up,
+                exclude_st=exclude_st,
+            )
+            if attempted == 0:
+                yield event.plain_result(
+                    "⚠️ 未得到候选标的（成交额阈值或剔除条件过严、或行情列缺失）。"
+                    + DISCLAIMER
+                )
+                return
+            if valid == 0:
+                yield event.plain_result(
+                    f"⚠️ 已对 {attempted} 只拉取日线，均无足够 K 线样本"
+                    f"（<{WYCKOFF_MIN_BARS} 根），无法进行威科夫启发式评分。"
+                    + DISCLAIMER
+                )
+                return
+
+            trunc = ""
+            if len(lines) > top_n:
+                trunc = f"💡 共 {len(lines)} 只入榜，仅展示前 {top_n}。\n"
+
+            text = format_wyckoff_report(
+                lines[:top_n],
+                regime,
+                title="📐 威科夫选股（启发式 · 七维）",
+                candidate_count=attempted,
+                valid_count=valid,
+                truncation_note=trunc,
+                min_amount_yi=min_amount_yi,
+                batch_mode=False,
+            )
+            yield event.plain_result(text)
+        except ImportError as e:
+            yield event.plain_result(
+                "❌ 需要 akshare 等依赖拉取行情\n请执行: pip install akshare"
+            )
+            logger.debug("威科夫选股 ImportError: %s", e)
+        except Exception as e:
+            logger.error(f"威科夫选股出错: {e}")
+            yield event.plain_result(f"❌ 执行失败: {e}")
+
+    @filter.command("威科夫批量分析")
+    async def stock_wyckoff_batch(self, event: AstrMessageEvent):
+        """
+        对指定多只 A 股输出威科夫启发式报告（与「短线批量分析」相同的代码列表格式）。
+        用法: 威科夫批量分析 <代码…> [展示条数1-50｜前N]
+        「加资金流」若写入将被忽略（本指令不含资金流因子）。
+        """
+        try:
+            tail = strip_command_prefix(get_event_plain_text(event), "威科夫批量分析")
+            codes, top_show = parse_wyckoff_batch_tail(tail)
+            if not codes:
+                yield event.plain_result(
+                    "用法: 威科夫批量分析 <代码1> [代码2] … [展示条数]\n"
+                    "• 七维：上证盘面 + 阶段近似 + 触发 + 量价 + 均线 + 赔率 + 仓位建议\n"
+                    "• 与「短线选股」打分无关；末尾数字或「前N」为展示条数（默认 "
+                    f"{DEFAULT_SHORT_TERM_BATCH_TOP}）\n"
+                    "• 单次最多 "
+                    f"{WYCKOFF_BATCH_MAX_CODES} 只\n"
+                    "示例:\n"
+                    "  威科夫批量分析 600519 000001 300750\n"
+                    "  威科夫批量分析 601398 601288 15\n"
+                    + DISCLAIMER
+                )
+                return
+
+            trunc_head = ""
+            if len(codes) > WYCKOFF_BATCH_MAX_CODES:
+                codes = codes[:WYCKOFF_BATCH_MAX_CODES]
+                trunc_head = (
+                    f"⚠️ 单次最多分析 {WYCKOFF_BATCH_MAX_CODES} 只，已截断多余代码。\n"
+                )
+
+            yield event.plain_result(
+                trunc_head
+                + f"📐 威科夫批量分析：共 {len(codes)} 只（启发式七维）\n"
+                + "⏳ 正在拉取上证指数与个股 60 日 K 线…"
+            )
+
+            lines, regime, attempted, valid = await batch_wyckoff_by_codes(
+                self.stock_analyzer,
+                self.analyzer,
+                codes,
+                max_concurrent=DEFAULT_SCREENING_CONCURRENCY,
+            )
+
+            if valid == 0:
+                yield event.plain_result(
+                    f"⚠️ 已对 {attempted} 只拉取日线，均无足够 K 线样本"
+                    f"（<{WYCKOFF_MIN_BARS} 根），无法评分。"
+                    + DISCLAIMER
+                )
+                return
+
+            trunc_note = ""
+            if len(lines) > top_show:
+                trunc_note = (
+                    f"💡 共 {len(lines)} 只入榜，仅展示前 {top_show} 条。\n"
+                )
+
+            text = format_wyckoff_report(
+                lines[:top_show],
+                regime,
+                title="📐 威科夫批量分析（启发式 · 七维）",
+                candidate_count=attempted,
+                valid_count=valid,
+                truncation_note=trunc_note,
+                min_amount_yi=0.0,
+                batch_mode=True,
+            )
+            yield event.plain_result(text)
+        except ImportError as e:
+            yield event.plain_result(
+                "❌ 需要 akshare 等依赖拉取行情\n请执行: pip install akshare"
+            )
+            logger.debug("威科夫批量分析 ImportError: %s", e)
+        except Exception as e:
+            logger.error(f"威科夫批量分析出错: {e}")
             yield event.plain_result(f"❌ 执行失败: {e}")
 
     @filter.command("量化分析")
@@ -2857,11 +3452,14 @@ class FundAnalyzerPlugin(Star):
         *,
         normalized_explicit_code: Optional[str] = None,
         progress_callback: Any = None,
-    ) -> tuple[Any, Any, Optional[str]]:
+        with_alignment: bool = False,
+    ) -> tuple[Any, Any, Optional[str], Any]:
         """
         拉取行情与资讯并执行 DebateEngine.run_debate。
-        成功返回 (DebateResult, FundInfo, None)，失败返回 (None, None, 面向用户的错误文案)。
+        成功返回 (DebateResult, FundInfo, None, alignment)，失败返回 (None, None, 文案, None)。
+        with_alignment=True 时第四项为 DailyAlignmentMetrics，否则为 None。
         """
+        from .stock.debate_alignment_metrics import compute_daily_alignment_metrics
         from .stock.debate_engine import DebateEngine
 
         info = await self.analyzer.get_lof_realtime(
@@ -2881,20 +3479,20 @@ class FundAnalyzerPlugin(Star):
                         return None, None, (
                             f"❌ 未找到基金代码 {fund_code}\n"
                             "💡 请检查代码是否正确，或使用「搜索基金 关键词」查找"
-                        )
+                        ), None
                 except Exception:
                     pass
             return None, None, (
                 f"⚠️ 暂时无法获取基金 {fund_code} 的数据\n"
                 "💡 可能是数据源暂时不可用，请稍后重试"
-            )
+            ), None
 
         provider = self.context.get_using_provider()
         if not provider:
             return None, None, (
                 "❌ 未配置大模型提供商\n"
                 "💡 请在 AstrBot 管理面板配置 LLM 提供商后再试"
-            )
+            ), None
 
         history_task = self.analyzer.get_lof_history(
             fund_code, days=60, prefer_otc=prefer_otc
@@ -2913,6 +3511,13 @@ class FundAnalyzerPlugin(Star):
         if not history_data or len(history_data) < 10:
             return None, None, (
                 f"⚠️ 基金 {fund_code} 历史数据不足，无法进行深度分析"
+            ), None
+
+        alignment_obj = None
+        if with_alignment:
+            alignment_obj = compute_daily_alignment_metrics(
+                history_data,
+                self.ai_analyzer.quant,
             )
 
         news_summary = await self.ai_analyzer.get_news_summary(info.name, info.code)
@@ -2933,7 +3538,7 @@ class FundAnalyzerPlugin(Star):
             eastmoney_api=self.analyzer._api,
             progress_callback=progress_callback,
         )
-        return debate_result, info, None
+        return debate_result, info, None, alignment_obj if with_alignment else None
 
     @filter.command("股票智能分析")
     async def multi_agent_debate(self, event: AstrMessageEvent, code: str = ""):
@@ -2959,7 +3564,7 @@ class FundAnalyzerPlugin(Star):
             async def on_progress(msg: str):
                 progress_messages.append(msg)
 
-            debate_result, info, err = await self._run_debate_pipeline_for_code(
+            debate_result, info, err, _align = await self._run_debate_pipeline_for_code(
                 fund_code,
                 prefer_otc,
                 normalized_explicit_code=normalized_code,
@@ -3430,8 +4035,11 @@ class FundAnalyzerPlugin(Star):
 🔹 量化精选基金 [分析上限] [输出条数] - 场内 LOF 列表批量量化排序（默认单页/top10，非投资建议）
 🔹 量化精选股票 [候选数] [输出条数] [去北交所] [去创业板] [去科技/去科创板/去科创] [去涨停/剔涨停/剔除涨停] - |涨跌幅|前筛+排序（默认150/10）；关键词可与数字任意顺序，不写则全市场；不写「去科技」则含科创板；「去涨停」为剔除涨跌幅>9%，默认关闭
 🔹 量化精选股票多空 [候选数] [输出条数] [智能分析上限] … - 同上筛选与剔除；第三数字可选，限制「股票智能分析」只数（默认不超过输出条数且单指令至多15只）；智能分析前按板块再判涨停，涨停跳过 LLM 仅输出说明；其余依次输出「代码 名称 看涨/看跌/中性」纯文本
-🔹 股票一日游 [展示条数] [去北交所] [去创业板] [去科技/去科创板/去科创] - 同上关键词；默认展示15最大50；3%~9%且量比>1.5→综合分前20%→分时（报告内说明量比近似）
-🔹 短线选股 [候选数] [输出条数] [额X亿] [加资金流] [去北交所] [去创业板] [去科技/去科创板/去科创] [去涨停] - 1-3日量价因子选股：动量+量能突破+量价共振+换手情绪+蓄势/位置+短期RSI；可选「加资金流/含主力」启用主力流向（顶部派发/底部吸筹/主散对冲，耗时+30~50%）；默认候选200/输出10/成交额≥1亿
+🔹 量化精选仓位计划 [本金…] [候选数] [输出条数] [智能分析上限] … - 同上辩论流程；须指定本金（如本金100万）；可选 风险1%/风险0.01、止损2ATR、分0.7、额均2亿、单票20%、最多5只；输出结构化快照（score/ts/日K对齐）与整手仓位演示+JSON（非投资建议）
+🔹 短线选股 [候选数] [输出条数] [额X亿] [加资金流] [加大盘] [加触发] [剔除关键词…] - |涨跌幅|候选 + 量价因子排序；「加大盘」拉上证并按档位缩放总分；「加触发」展示威科夫主触发并小额加减分；与「威科夫选股」候选近似但默认打分不同
+🔹 短线批量分析 <代码…> [加资金流] [加大盘] [加触发] [展示条数] - 同源量价因子批量打分；单次最多约40只；展示条数默认20、最大50
+🔹 威科夫选股 [候选数] [输出条数] [额X亿] [剔除关键词…] - 上证盘面水温 + 阶段/触发/量价/均线/赔率/仓位建议（启发式，不含资金流）；候选规则贴近短线选股；单次拉上证指数一次；有效样本需不少于约52根日K
+🔹 威科夫批量分析 <代码…> [展示条数] - 对指定代码输出同上威科夫七维报告（与短线打分无关）；「加资金流」写入会被忽略；单次最多约40只
 💡 东财快照含原生量比；新浪源多为自建近似。分时依赖当日分钟 K。
 💡 量化精选结果优先以图片呈现（首选本地渲染，不可用则尝试网络渲染；均失败时为文本表格）。
 💡 并发拉多档 K 线时若频繁断连，多为数据源限流或网络原因，可稍后重试或减少分析数量。
@@ -3468,11 +4076,20 @@ class FundAnalyzerPlugin(Star):
   • 量化精选股票 去涨停 150 10
   • 量化精选股票多空 150 10 3
   • 量化精选股票多空 去创业板 150 10
-  • 股票一日游 15 去创业板
+  • 量化精选仓位计划 本金100万 150 10 3 风险1% 止损2ATR 分0.7
+  • 量化精选仓位计划 本金50w 150 10 额均2亿 单票20% 最多5只
   • 短线选股 200 10
   • 短线选股 去创业板 额2亿 200 10
-  • 短线选股 加资金流 200 10        （含主力流向因子）
-  • 短线选股 加主力 去涨停 150 8
+  • 短线选股 加资金流 200 10
+  • 短线选股 加触发 200 10
+  • 短线选股 加大盘 加触发 150 8
+  • 短线批量分析 601398 601288 加大盘 前15
+  • 短线批量分析 688981 加资金流
+  • 短线批量分析 601398 601288 前15
+  • 威科夫选股 200 10
+  • 威科夫选股 去创业板 额2亿 150 8
+  • 威科夫批量分析 600519 000001
+  • 威科夫批量分析 601288 300750 前12
   • 量化精选基金 400 10
   • 智能分析 161226
   • 股票智能分析 161226

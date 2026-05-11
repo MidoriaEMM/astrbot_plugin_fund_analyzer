@@ -7,5 +7,5 @@ jinja2>=3.0.0
 playwright>=1.40.0
 markdown>=3.4.0
 #新增tickflow 不行需要手动 pip install "tickflow[all]" --upgrade
-tickflow>=1.0.0
+#新增tushare pip install tushare
 #删除numpy conapy（好像叫这个） 更新playwright 不需要pandas potable版本

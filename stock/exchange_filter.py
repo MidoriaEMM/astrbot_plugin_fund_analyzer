@@ -18,8 +18,12 @@ def normalize_screening_code(raw: str) -> str:
 
 
 def is_chinext_code(code: str) -> bool:
+    """
+    深市创业板：历史号段 300/301，注册制及扩展后为统一 30xxxx（含 302 等），
+    与沪主板(60/68…)、深主板(000/001/002…)互不重叠。
+    """
     c = (code or "").zfill(6)
-    return c.startswith("300") or c.startswith("301")
+    return len(c) == 6 and c.startswith("30")
 
 
 def is_star_market_code(code: str) -> bool:
@@ -34,6 +38,23 @@ def is_beijing_exchange_code(code: str) -> bool:
     return any(c.startswith(p) for p in ("43", "83", "87", "88", "92"))
 
 
+def is_st_stock_name(name: str | None) -> bool:
+    """
+    是否 A 股风险警示简称：*ST / ＊ST / S*ST / 以 ST 开头的简写名。
+    用于行情快照无独立 ST 标记时的名称识别。
+    """
+    if name is None:
+        return False
+    n = str(name).strip()
+    if not n:
+        return False
+    if re.search(r"(?i)S\*ST", n):
+        return True
+    if re.search(r"(?:\*|＊)\s*ST", n):
+        return True
+    if re.match(r"(?i)ST[\u4e00-\u9fffA-Za-z0-9]", n):
+        return True
+    return False
 def should_exclude_a_share(
     code: str,
     *,

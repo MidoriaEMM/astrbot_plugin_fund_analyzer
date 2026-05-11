@@ -3,7 +3,7 @@
 不构成投资建议。
 
 设计要点
-- 与「量化精选股票」（中线综合分 + 夏普）和「股票一日游」（当日分时博弈）形成差异化：
+- 与「量化精选股票」（日线综合分 + 夏普）形成差异化：
   本模块专注于 60 日日线之上的「量价共振 / 量能突破 / 短期动量 / 蓄势待发」等
   适合 1-3 天持仓的短线信号。
 - 仅依赖已存在的 60 日 K 线（每条含 open/close/high/low/volume/amount/change_rate），
@@ -13,13 +13,14 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
 
 from astrbot.api import logger
 
-from .exchange_filter import should_exclude_a_share
+from .exchange_filter import is_st_stock_name, should_exclude_a_share
 from ..quant_screening import (
     DEFAULT_SCREENING_CONCURRENCY,
     DISCLAIMER,
@@ -36,6 +37,9 @@ SHORT_TERM_DEFAULT_TOP = 10
 
 # 因子计算所需最少 K 线根数（短线核心窗口 5/10/20）
 SHORT_TERM_MIN_BARS = 22
+
+# 「短线批量分析」单次允许的最大代码数（防止误传超长列表导致大批 K 线请求）
+SHORT_TERM_BATCH_MAX_CODES = 40
 
 
 def _normalize_screening_code(raw: str) -> str:
@@ -731,6 +735,18 @@ class ShortTermLine:
     has_fund_flow: bool         # 是否启用并取得了资金流数据
     top_reason: str
     top_risk: str
+    wyckoff_trigger: str = ""  # 「加触发」时威科夫主触发简称
+
+
+def _short_term_market_score_multiplier(regime_label: str) -> float:
+    """上证档位对量价综合分的温和缩放。"""
+    return {
+        "停手观望": 0.82,
+        "高位防派发": 0.90,
+        "轻仓试探": 0.96,
+        "可进攻": 1.0,
+        "未知": 1.0,
+    }.get(regime_label, 1.0)
 
 
 def _pairs_for_short_term(
@@ -742,6 +758,7 @@ def _pairs_for_short_term(
     exclude_chinext: bool,
     exclude_star: bool,
     exclude_limit_up: bool,
+    exclude_st: bool = True,
 ) -> list[tuple[str, str]]:
     """
     候选筛选：
@@ -749,7 +766,7 @@ def _pairs_for_short_term(
     - 优先按 |涨跌幅| 降序选活跃股；
     - 用「成交额」列过滤流动性陷阱（min_amount_yi 亿元，东财快照单位为元，
       取近似快照成交额，等价于今日成交额）；
-    - 可选剔除 北交所/创业板/科创板/B 股/涨幅 > SCREENING_EXCLUDE_IF_CHANGE_PCT_GT。
+    - 可选剔除 北交所/创业板/科创板/B 股/涨幅 > SCREENING_EXCLUDE_IF_CHANGE_PCT_GT / *ST·ST（默认剔 ST）。
     """
     import pandas as pd
 
@@ -796,6 +813,9 @@ def _pairs_for_short_term(
             exclude_star=exclude_star,
         ):
             continue
+        nm = str(row[name_col]) if name_col else ""
+        if exclude_st and is_st_stock_name(nm):
+            continue
         if amt_col is not None and min_amount > 0:
             amt = pd.to_numeric(row.get(amt_col), errors="coerce")
             if pd.isna(amt) or float(amt) < min_amount:
@@ -805,7 +825,6 @@ def _pairs_for_short_term(
             pct_f = 0.0 if pd.isna(raw_pct) else float(raw_pct)
             if pct_f > SCREENING_EXCLUDE_IF_CHANGE_PCT_GT:
                 continue
-        nm = str(row[name_col]) if name_col else ""
         pairs.append((c, nm))
     return pairs
 
@@ -855,24 +874,31 @@ async def screen_stocks_short_term(
     exclude_chinext: bool = False,
     exclude_star: bool = False,
     exclude_limit_up: bool = False,
+    exclude_st: bool = True,
     with_fund_flow: bool = False,
-) -> tuple[list[ShortTermLine], int, int, int]:
+    with_market_regime: bool = False,
+    with_wyckoff_trigger: bool = False,
+) -> tuple[list[ShortTermLine], int, int, int, Any]:
     """
     主流程：A 股快照 → 候选筛选 → 批量拉 60 日 K 线（可选并行拉资金流）→ 综合打分。
 
     Args:
-        with_fund_flow: 是否启用主力资金流向因子（G 段）。开启后每只标的会
-                        额外发一次资金流 HTTP，整体耗时 +30~50%。
+        with_market_regime: 拉上证指数并按档位缩放总分（惰性导入 wyckoff_screen）。
+        with_wyckoff_trigger: 威科夫主触发检测与小额加减分。
 
     Returns:
-        lines:        已按 score 降序排列的 ShortTermLine 列表
-        attempted:    实际尝试拉 K 线的标的数
-        valid:        K 线足够形成因子的有效样本数
-        with_flow_n:  with_fund_flow=True 时，成功取得资金流数据的样本数；False 时为 0
+        ``lines, attempted, valid, with_flow_n, regime_snapshot``
+        ``regime_snapshot`` 仅 ``with_market_regime=True`` 时为对象，否则为 ``None``。
     """
     df = await stock_analyzer.get_a_share_spot_for_screening()
     if df is None or len(df) == 0:
-        return [], 0, 0, 0
+        return [], 0, 0, 0, None
+
+    regime: Any = None
+    if with_market_regime:
+        from . import wyckoff_screen as wx
+
+        regime = await wx.fetch_market_regime_once(fund_analyzer)
 
     pairs = _pairs_for_short_term(
         df,
@@ -882,23 +908,27 @@ async def screen_stocks_short_term(
         exclude_chinext=exclude_chinext,
         exclude_star=exclude_star,
         exclude_limit_up=exclude_limit_up,
+        exclude_st=exclude_st,
     )
     attempted = len(pairs)
     if not pairs:
-        return [], 0, 0, 0
+        return [], attempted, 0, 0, regime
 
     lines = await _batch_compute_lines(
         fund_analyzer,
         pairs,
         max_concurrent=max_concurrent,
         with_fund_flow=with_fund_flow,
+        regime_snapshot=regime,
+        with_market_regime=with_market_regime,
+        with_wyckoff_trigger=with_wyckoff_trigger,
     )
     valid = len(lines)
     with_flow_n = sum(1 for ln in lines if ln.has_fund_flow)
     if not lines:
-        return [], attempted, 0, 0
+        return [], attempted, 0, 0, regime
     lines.sort(key=lambda x: -x.score)
-    return lines, attempted, valid, with_flow_n
+    return lines, attempted, valid, with_flow_n, regime
 
 
 async def _batch_compute_lines(
@@ -907,6 +937,9 @@ async def _batch_compute_lines(
     *,
     max_concurrent: int = DEFAULT_SCREENING_CONCURRENCY,
     with_fund_flow: bool = False,
+    regime_snapshot: Any = None,
+    with_market_regime: bool = False,
+    with_wyckoff_trigger: bool = False,
 ) -> list[ShortTermLine]:
     """
     并发拉 K 线（可选并行拉资金流）→ 因子化 → ShortTermLine 列表。
@@ -966,10 +999,134 @@ async def _batch_compute_lines(
         hist, flow = await asyncio.gather(fetch_kline(code), fetch_flow(code))
         if not hist:
             return None
-        return _line_from_history(code, nm, hist, flow_data=flow)
+        ln = _line_from_history(code, nm, hist, flow_data=flow)
+        if ln is None:
+            return None
+        if with_market_regime and regime_snapshot is not None:
+            lab = str(getattr(regime_snapshot, "label", "") or "")
+            mult = _short_term_market_score_multiplier(lab)
+            ln.score = round(max(0.0, min(100.0, ln.score * mult)), 1)
+        if with_wyckoff_trigger:
+            from . import wyckoff_screen as wx
+
+            trig, _tn = wx.detect_primary_trigger_from_history(hist)
+            disp = trig if len(trig) <= 8 else trig[:7] + "…"
+            ln.wyckoff_trigger = disp
+            ln.score = round(
+                max(
+                    0.0,
+                    min(100.0, ln.score + wx.trigger_score_bonus(trig)),
+                ),
+                1,
+            )
+        return ln
 
     results = await asyncio.gather(*[one(c, n) for c, n in pairs])
     return [r for r in results if r is not None]
+
+
+# ============================================================
+# 用户传入代码：批量分析（与「短线选股」同源因子）
+# ============================================================
+
+
+_SIX_DIGIT_CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
+
+
+def parse_stock_codes_from_text(tail: str, *, max_codes: int | None = None) -> list[str]:
+    """
+    从自由文本中提取所有六位数字股票代码，按出现顺序去重。
+
+    - 输入示例：``"600519 000001,300750 加资金流"`` → ``["600519", "000001", "300750"]``
+    - ``max_codes`` 非空时仅截取前 N 个；传入 None 表示不截断（由调用方校验）。
+    """
+    if not tail:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in _SIX_DIGIT_CODE_RE.findall(tail):
+        c = _normalize_screening_code(raw)
+        if not c or c in seen:
+            continue
+        if _is_b_share(c):
+            continue
+        seen.add(c)
+        out.append(c)
+        if max_codes is not None and len(out) >= max_codes:
+            break
+    return out
+
+
+async def batch_analyze_short_term_by_codes(
+    stock_analyzer: Any,
+    fund_analyzer: Any,
+    codes: list[str],
+    *,
+    max_concurrent: int = DEFAULT_SCREENING_CONCURRENCY,
+    with_fund_flow: bool = False,
+    with_market_regime: bool = False,
+    with_wyckoff_trigger: bool = False,
+) -> tuple[list[ShortTermLine], int, int, int, Any]:
+    """
+    用与「短线选股」完全一致的因子（``compute_short_term_factors`` +
+    ``score_short_term_factors``）对 **用户给定** 的代码列表批量打分。
+
+    名称解析：并发调用 ``stock_analyzer.get_stock_realtime`` 取 ``StockInfo.name``，
+    失败则用空字符串占位（不影响打分）。
+
+    Args:
+        stock_analyzer: 用于解析名称
+        fund_analyzer: 透传给 ``_batch_compute_lines`` 拉 60 日 K（与短线选股同链路）
+        codes: 已规范化的六位代码（建议先经过 ``parse_stock_codes_from_text``）
+        max_concurrent: 单批并发数，与短线选股一致
+        with_fund_flow: 是否启用主力资金流向因子
+        with_market_regime / with_wyckoff_trigger: 与 ``screen_stocks_short_term`` 一致
+
+    Returns:
+        ``(lines, attempted, valid, with_flow_n, regime_snapshot)``
+        ``regime_snapshot`` 仅 ``with_market_regime=True`` 时为对象，否则为 ``None``。
+    """
+    import asyncio
+
+    if not codes:
+        return [], 0, 0, 0, None
+
+    regime: Any = None
+    if with_market_regime:
+        from . import wyckoff_screen as wx
+
+        regime = await wx.fetch_market_regime_once(fund_analyzer)
+
+    sem_name = asyncio.Semaphore(max_concurrent)
+
+    async def resolve_name(code: str) -> str:
+        async with sem_name:
+            try:
+                info = await stock_analyzer.get_stock_realtime(code)
+            except Exception as e:
+                logger.debug(f"短线批量分析名称解析失败 {code}: {e}")
+                return ""
+        if info is None:
+            return ""
+        return str(getattr(info, "name", "") or "")
+
+    names = await asyncio.gather(*[resolve_name(c) for c in codes])
+    pairs: list[tuple[str, str]] = list(zip(codes, names))
+
+    lines = await _batch_compute_lines(
+        fund_analyzer,
+        pairs,
+        max_concurrent=max_concurrent,
+        with_fund_flow=with_fund_flow,
+        regime_snapshot=regime,
+        with_market_regime=with_market_regime,
+        with_wyckoff_trigger=with_wyckoff_trigger,
+    )
+    attempted = len(pairs)
+    valid = len(lines)
+    with_flow_n = sum(1 for ln in lines if ln.has_fund_flow)
+    lines.sort(key=lambda x: -x.score)
+    return lines, attempted, valid, with_flow_n, regime
 
 
 # ============================================================
@@ -987,17 +1144,35 @@ def format_short_term_report(
     min_amount_yi: float = SHORT_TERM_MIN_AMOUNT_YI,
     with_fund_flow: bool = False,
     fund_flow_count: int = 0,
+    batch_mode: bool = False,
+    extra_pool_lines: str = "",
+    with_wyckoff_trigger: bool = False,
 ) -> str:
+    """渲染短线评分报告。
+
+    ``batch_mode=True`` 时表头第二行改为「指定标的: N 只 · …」并省略「成交额≥X亿」，
+    用于「短线批量分析」等用户给定标的池的场景；其余结构与短线选股一致。
+    """
     flow_meta = (
         f" · 含主力流向: {fund_flow_count}/{valid_count}"
         if with_fund_flow
         else ""
     )
+    if batch_mode:
+        pool_line = f"指定标的: {candidate_count} 只 · 有效: {valid_count} 只{flow_meta}\n"
+    else:
+        pool_line = (
+            f"候选: {candidate_count} 只 · 有效: {valid_count} 只 · "
+            f"成交额≥{min_amount_yi}亿{flow_meta}\n"
+        )
+    extra = (extra_pool_lines.strip() + "\n") if extra_pool_lines and extra_pool_lines.strip() else ""
+    trig_w = 9
+
     header = (
         f"{title}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"候选: {candidate_count} 只 · 有效: {valid_count} 只 · "
-        f"成交额≥{min_amount_yi}亿{flow_meta}\n"
+        f"{pool_line}"
+        f"{extra}"
         f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
     )
@@ -1005,16 +1180,20 @@ def format_short_term_report(
         body = "无满足条件的标的。\n"
         return header + body + (truncation_note or "") + DISCLAIMER
 
+    trig_h = f"{'触发':<{trig_w}}" if with_wyckoff_trigger else ""
+
     # 仅在开启资金流时展示「主力%」列；关闭时省略以保持紧凑
     if with_fund_flow:
         col = (
             f"{'排名':<4}{'代码':<8}{'名称':<11}{'评分':<6}{'信号':<8}"
+            f"{trig_h}"
             f"{'5日%':<8}{'量比5/20':<9}{'换手%':<8}{'主力3日%':<10}"
             f"{'位置':<6}{'突破':<5}\n"
         )
     else:
         col = (
             f"{'排名':<4}{'代码':<8}{'名称':<11}{'评分':<6}{'信号':<8}"
+            f"{trig_h}"
             f"{'5日%':<8}{'量比5/20':<9}{'换手%':<8}{'位置':<6}{'突破':<5}\n"
         )
     body_lines = [col]
@@ -1025,6 +1204,12 @@ def format_short_term_report(
             if r.turnover_pct_20d >= 0
             else f"{'—':<8}"
         )
+        if with_wyckoff_trigger:
+            tt = (r.wyckoff_trigger or "—").strip() or "—"
+            trig_disp = tt if len(tt) <= trig_w - 1 else tt[: trig_w - 2] + "…"
+            trig_fmt = f"{trig_disp:<{trig_w}}"
+        else:
+            trig_fmt = ""
         if with_fund_flow:
             if r.has_fund_flow:
                 # cap 到 ±99.99% 防御异常数据口径
@@ -1034,6 +1219,7 @@ def format_short_term_report(
                 flow_cell = f"{'—':<10}"
             body_lines.append(
                 f"{i:<4}{r.code:<8}{nm:<11}{r.score:<6.1f}{r.signal:<8}"
+                f"{trig_fmt}"
                 f"{r.momentum_5d:+.2f}%{'':>1}{r.volume_ratio:<9.2f}"
                 f"{turnover_cell}{flow_cell}{r.price_position_20d:<6.2f}"
                 f"{'是' if r.breakout else '否':<5}\n"
@@ -1041,6 +1227,7 @@ def format_short_term_report(
         else:
             body_lines.append(
                 f"{i:<4}{r.code:<8}{nm:<11}{r.score:<6.1f}{r.signal:<8}"
+                f"{trig_fmt}"
                 f"{r.momentum_5d:+.2f}%{'':>1}{r.volume_ratio:<9.2f}"
                 f"{turnover_cell}{r.price_position_20d:<6.2f}"
                 f"{'是' if r.breakout else '否':<5}\n"
@@ -1048,11 +1235,14 @@ def format_short_term_report(
 
     detail_lines: list[str] = []
     for i, r in enumerate(lines[:5], 1):  # 仅展示前 5 名详情
-        detail_lines.append(
+        blob = (
             f"#{i} {r.code} {r.name}\n"
             f"   ✓ {r.top_reason}\n"
             f"   ⚠ {r.top_risk}"
         )
+        if with_wyckoff_trigger:
+            blob += f"\n   · 触发: {r.wyckoff_trigger or '—'}"
+        detail_lines.append(blob)
     detail = "\n详情（前 5 名）:\n" + "\n".join(detail_lines) if detail_lines else ""
 
     return (

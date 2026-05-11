@@ -27,7 +27,12 @@ RETRY_DELAY = 2
 class StockAnalyzer:
     """A股股票分析器"""
 
-    def __init__(self, tickflow_api_key: str | None = None):
+    def __init__(
+        self,
+        tickflow_api_key: str | None = None,
+        *,
+        tushare_token: str | None = None,
+    ):
         self._ak = None
         self._pd = None
         self._initialized = False
@@ -35,13 +40,19 @@ class StockAnalyzer:
         self._stock_cache = None
         self._stock_cache_time = None
         # 当前使用的数据源
-        self._current_source = "eastmoney"  # 可选: tickflow, eastmoney, sina
+        self._current_source = "eastmoney"  # 可选: tushare, tickflow, eastmoney, sina
         _tf = (
             tickflow_api_key
             if tickflow_api_key is not None
             else os.getenv("TICKFLOW_API_KEY")
         )
         self._tickflow_key = (_tf or "").strip() or None
+        _ts = (
+            tushare_token
+            if tushare_token is not None
+            else os.getenv("TUSHARE_TOKEN")
+        )
+        self._tushare_token = (_ts or "").strip() or None
 
     async def _ensure_init(self):
         """确保akshare已初始化"""
@@ -173,9 +184,25 @@ class StockAnalyzer:
 
     async def get_a_share_spot_for_screening(self) -> Any:
         """
-        量化精选 / 短线选股前筛用：已配置 Tickflow 时优先拉 CN_Equity_A 全市场快照；
-        成功时不写入 _stock_cache；失败或未配置 Key 时回退 _get_stock_data()（AKShare）。
+        量化精选 / 短线选股前筛用：配置了 Tushare 时优先 ``rt_k`` 全市场快照；
+        失败则尝试 Tickflow ``CN_Equity_A``；再失败或未配置密钥时回退 ``_get_stock_data()``。
         """
+        if self._tushare_token:
+            try:
+                from ..tushare_client import fetch_cn_equity_a_spot_dataframe
+
+                df = await asyncio.to_thread(
+                    fetch_cn_equity_a_spot_dataframe, self._tushare_token
+                )
+                if df is not None and len(df) > 0:
+                    self._current_source = "tushare"
+                    logger.info(f"A股前筛快照（Tushare rt_k）共 {len(df)} 条")
+                    return df
+            except ImportError as e:
+                logger.warning(f"Tushare 全市场快照不可用（依赖缺失）: {e}")
+            except Exception as e:
+                logger.warning(f"Tushare 全市场快照失败（https://tushare.pro/document/2?doc_id=372）：{e}")
+
         if self._tickflow_key:
             try:
                 from ..tickflow_client import fetch_cn_equity_a_spot_dataframe
@@ -279,6 +306,21 @@ class StockAnalyzer:
         # 确保股票代码是字符串格式
         stock_code = str(stock_code).strip()
         logger.debug(f"查询股票代码: '{stock_code}'")
+
+        if self._tushare_token:
+            try:
+                from ..tushare_client import fetch_quote_realtime, quote_to_stock_fields
+
+                q = await asyncio.to_thread(
+                    fetch_quote_realtime, self._tushare_token, stock_code
+                )
+                if isinstance(q, dict) and q:
+                    self._current_source = "tushare"
+                    return StockInfo(**quote_to_stock_fields(q, stock_code))
+            except ImportError as e:
+                logger.warning(f"Tushare 未安装或不可导入，跳过该数据源: {e}")
+            except Exception as e:
+                logger.warning(f"Tushare 个股行情失败，尝试 Tickflow/AKShare: {e}")
 
         if self._tickflow_key:
             try:

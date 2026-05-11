@@ -92,10 +92,21 @@ class EastMoneyAPI:
         self._session: Optional[aiohttp.ClientSession] = None
         # Tickflow 日K（优先于 push2his）；None 时仍可读 TICKFLOW_API_KEY
         self._tickflow_api_key: Optional[str] = None
+        # Tushare（优先于 Tickflow）；None 时仍可读 TUSHARE_TOKEN
+        self._tushare_token: Optional[str] = None
 
     def set_tickflow_api_key(self, key: Optional[str]) -> None:
         """插件配置的 Key；空串归一为未设置，此时回退环境变量 TICKFLOW_API_KEY。"""
         self._tickflow_api_key = (key or "").strip() or None
+
+    def set_tushare_token(self, token: Optional[str]) -> None:
+        """插件配置的 Token；空串视为未设置，回退环境变量 TUSHARE_TOKEN。"""
+        self._tushare_token = (token or "").strip() or None
+
+    def _effective_tushare_token(self) -> Optional[str]:
+        if self._tushare_token:
+            return self._tushare_token
+        return (os.getenv("TUSHARE_TOKEN") or "").strip() or None
 
     def _effective_tickflow_key(self) -> Optional[str]:
         if self._tickflow_api_key:
@@ -781,6 +792,73 @@ class EastMoneyAPI:
         
         return None
 
+    async def get_kline_history_by_secid(
+        self,
+        secid: str,
+        days: int = 60,
+        adjust: str = "qfq",
+        *,
+        max_retries: int = 3,
+    ) -> Optional[list]:
+        """
+        按东方财富 secid 拉日 K（不经 Tushare/Tickflow），用于指数等无法用六位代码判市的标的。
+        例：上证指数 secid=1.000001。
+        """
+        secid = str(secid).strip()
+        if not secid or "." not in secid:
+            return None
+        d_need = max(int(days), 1)
+        fq_map = {"qfq": "1", "hfq": "2", "": "0"}
+        fq = fq_map.get(adjust, "1")
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=d_need * 3 + 60)
+        params = {
+            "secid": secid,
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+            "klt": "101",
+            "fqt": fq,
+            "beg": start_date.strftime("%Y%m%d"),
+            "end": end_date.strftime("%Y%m%d"),
+            "lmt": str(d_need * 3),
+        }
+        data = await self._request(self.KLINE_API, params, max_retries=max_retries)
+        if not data or data.get("rc") != 0:
+            return None
+        klines = (data.get("data") or {}).get("klines") or []
+        if not klines:
+            return None
+        history: list[dict] = []
+        for line in klines:
+            parts = line.split(",")
+            if len(parts) < 11:
+                continue
+            try:
+                try:
+                    turnover_rate = (
+                        float(parts[10]) if parts[10] not in ("", "-") else 0.0
+                    )
+                except (ValueError, IndexError):
+                    turnover_rate = 0.0
+                history.append(
+                    {
+                        "date": parts[0],
+                        "open": float(parts[1]),
+                        "close": float(parts[2]),
+                        "high": float(parts[3]),
+                        "low": float(parts[4]),
+                        "volume": float(parts[5]),
+                        "amount": float(parts[6]),
+                        "change_rate": float(parts[8]) if parts[8] else 0.0,
+                        "turnover_rate": turnover_rate,
+                    }
+                )
+            except (ValueError, IndexError):
+                continue
+        if not history:
+            return None
+        return history[-d_need:] if len(history) > d_need else history
+
     async def _get_exchange_fund_history(
         self,
         fund_code: str,
@@ -801,6 +879,31 @@ class EastMoneyAPI:
         Returns:
             历史数据列表或 None
         """
+        d_need = max(int(days), 1)
+        min_required = min(d_need, 5)
+
+        ts_tok = self._effective_tushare_token()
+        if ts_tok:
+            try:
+                from .tushare_client.klines import fetch_daily_klines_as_eastmoney_history
+
+                hist = await asyncio.to_thread(
+                    fetch_daily_klines_as_eastmoney_history,
+                    ts_tok,
+                    fund_code,
+                    days,
+                    adjust,
+                )
+                if hist and len(hist) >= min_required:
+                    logger.info(
+                        f"场内K线优先 Tushare 日K: {fund_code}，{len(hist)} 条"
+                    )
+                    return hist
+            except ImportError as e:
+                logger.warning(f"Tushare K 线模块不可用: {e}")
+            except Exception as e:
+                logger.warning(f"Tushare 日K 失败，尝试 Tickflow/东财: {e}")
+
         tf_key = self._effective_tickflow_key()
         if tf_key:
             try:
@@ -815,11 +918,9 @@ class EastMoneyAPI:
                     days,
                     adjust,
                 )
-                d_need = max(int(days), 1)
-                min_required = min(d_need, 5)
                 if hist and len(hist) >= min_required:
                     logger.info(
-                        f"场内K线优先 Tickflow 日K: {fund_code}，{len(hist)} 条"
+                        f"场内K线 Tickflow 日K: {fund_code}，{len(hist)} 条"
                     )
                     return hist
             except ImportError as e:
@@ -1233,8 +1334,9 @@ class EastMoneyAPI:
         """
         获取基金/股票资金流向数据（主力净流入等）
 
-        依次尝试：东方财富push2 → 东方财富datacenter
-        仅场内基金有资金流向数据，场外基金返回 None
+        依次尝试：**Tushare moneyflow_dc**（https://tushare.pro/document/2?doc_id=349）
+        → 东方财富 push2 → 东方财富 datacenter。
+        仅场内基金有资金流向数据，场外基金返回 None。
 
         Args:
             fund_code: 基金代码（场内ETF/LOF/股票）
@@ -1247,7 +1349,32 @@ class EastMoneyAPI:
             return None
         if prefer_otc is None and self._is_otc_fund(fund_code):
             return None
-        
+
+        ts_tok = self._effective_tushare_token()
+        if ts_tok:
+            try:
+                from .tushare_client.fund_flow_dc import (
+                    fetch_daily_moneyflow_as_em_fund_flow_list,
+                )
+
+                tushare_hist = await asyncio.to_thread(
+                    fetch_daily_moneyflow_as_em_fund_flow_list,
+                    ts_tok,
+                    fund_code,
+                    days,
+                )
+                if tushare_hist:
+                    logger.info(
+                        f"A股/场内资金流向优先 Tushare moneyflow_dc: {fund_code}，{len(tushare_hist)} 条"
+                    )
+                    return tushare_hist
+            except ImportError as e:
+                logger.warning(f"Tushare 资金流向模块不可用: {e}")
+            except Exception as e:
+                logger.warning(
+                    f"Tushare moneyflow_dc 失败(doc_id=349)，尝试东财: {e}"
+                )
+
         # === 1. 东方财富 push2 主源 ===
         result = await self._get_fund_flow_eastmoney(fund_code, days)
         if result:
