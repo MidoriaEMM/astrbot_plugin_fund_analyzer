@@ -323,20 +323,8 @@ class FundAnalyzer:
     async def get_cn_equity_a_breadth(self) -> dict[str, Any] | None:
         """
         A 股涨跌广度（与全市场快照列对齐）。
-        优先级：Tushare ``rt_k`` → Tickflow ``CN_Equity_A``；失败返回 ``None``。
+        优先级：Tickflow ``CN_Equity_A`` → Tushare ``rt_k``；失败返回 ``None``。
         """
-        ts_tok = self._api._effective_tushare_token()
-        if ts_tok:
-            try:
-                from .tushare_client.breadth import fetch_cn_equity_a_breadth as _ts_breadth
-
-                b = await asyncio.to_thread(_ts_breadth, ts_tok)
-                if b and int(b.get("valid") or 0) > 0:
-                    logger.info("A股涨跌广度 优先 Tushare rt_k")
-                    return b
-            except Exception as e:
-                logger.debug(f"Tushare 涨跌广度失败: {e}")
-
         tf_key = self._api._effective_tickflow_key()
         if tf_key:
             try:
@@ -347,7 +335,19 @@ class FundAnalyzer:
                     logger.info("A股涨跌广度 Tickflow CN_Equity_A")
                     return b
             except Exception as e:
-                logger.debug(f"Tickflow 涨跌广度失败: {e}")
+                logger.debug(f"Tickflow 涨跌广度失败，尝试 Tushare: {e}")
+
+        ts_tok = self._api._effective_tushare_token()
+        if ts_tok:
+            try:
+                from .tushare_client.breadth import fetch_cn_equity_a_breadth as _ts_breadth
+
+                b = await asyncio.to_thread(_ts_breadth, ts_tok)
+                if b and int(b.get("valid") or 0) > 0:
+                    logger.info("A股涨跌广度 Tushare rt_k")
+                    return b
+            except Exception as e:
+                logger.debug(f"Tushare 涨跌广度失败: {e}")
 
         return None
 

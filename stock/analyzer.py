@@ -184,9 +184,25 @@ class StockAnalyzer:
 
     async def get_a_share_spot_for_screening(self) -> Any:
         """
-        量化精选 / 短线选股前筛用：配置了 Tushare 时优先 ``rt_k`` 全市场快照；
-        失败则尝试 Tickflow ``CN_Equity_A``；再失败或未配置密钥时回退 ``_get_stock_data()``。
+        量化精选 / 短线选股前筛用。
+        优先级：Tickflow ``CN_Equity_A``（实时全市场）→ Tushare ``rt_k`` → AKShare 全表。
         """
+        if self._tickflow_key:
+            try:
+                from ..tickflow_client import fetch_cn_equity_a_spot_dataframe
+
+                df = await asyncio.to_thread(
+                    fetch_cn_equity_a_spot_dataframe, self._tickflow_key
+                )
+                if df is not None and len(df) > 0:
+                    self._current_source = "tickflow"
+                    logger.info(f"A股前筛快照（Tickflow CN_Equity_A）共 {len(df)} 条")
+                    return df
+            except ImportError as e:
+                logger.warning(f"Tickflow 全市场快照不可用（依赖缺失）: {e}")
+            except Exception as e:
+                logger.warning(f"Tickflow 全市场快照失败，尝试 Tushare: {e}")
+
         if self._tushare_token:
             try:
                 from ..tushare_client import fetch_cn_equity_a_spot_dataframe
@@ -201,25 +217,7 @@ class StockAnalyzer:
             except ImportError as e:
                 logger.warning(f"Tushare 全市场快照不可用（依赖缺失）: {e}")
             except Exception as e:
-                logger.warning(f"Tushare 全市场快照失败（https://tushare.pro/document/2?doc_id=372）：{e}")
-
-        if self._tickflow_key:
-            try:
-                from ..tickflow_client import fetch_cn_equity_a_spot_dataframe
-
-                df = await asyncio.to_thread(
-                    fetch_cn_equity_a_spot_dataframe, self._tickflow_key
-                )
-                if df is not None and len(df) > 0:
-                    self._current_source = "tickflow"
-                    logger.info(
-                        f"A股前筛快照（Tickflow CN_Equity_A）共 {len(df)} 条"
-                    )
-                    return df
-            except ImportError as e:
-                logger.warning(f"Tickflow 全市场快照不可用（依赖缺失）: {e}")
-            except Exception as e:
-                logger.warning(f"Tickflow 全市场快照失败，回退 AKShare: {e}")
+                logger.warning(f"Tushare 全市场快照失败（https://tushare.pro/document/2?doc_id=372），回退 AKShare: {e}")
 
         return await self._get_stock_data()
 
@@ -307,21 +305,6 @@ class StockAnalyzer:
         stock_code = str(stock_code).strip()
         logger.debug(f"查询股票代码: '{stock_code}'")
 
-        if self._tushare_token:
-            try:
-                from ..tushare_client import fetch_quote_realtime, quote_to_stock_fields
-
-                q = await asyncio.to_thread(
-                    fetch_quote_realtime, self._tushare_token, stock_code
-                )
-                if isinstance(q, dict) and q:
-                    self._current_source = "tushare"
-                    return StockInfo(**quote_to_stock_fields(q, stock_code))
-            except ImportError as e:
-                logger.warning(f"Tushare 未安装或不可导入，跳过该数据源: {e}")
-            except Exception as e:
-                logger.warning(f"Tushare 个股行情失败，尝试 Tickflow/AKShare: {e}")
-
         if self._tickflow_key:
             try:
                 from ..tickflow_client import (
@@ -338,7 +321,22 @@ class StockAnalyzer:
             except ImportError as e:
                 logger.warning(f"Tickflow 未安装或不可导入，跳过该数据源: {e}")
             except Exception as e:
-                logger.warning(f"Tickflow 获取行情失败，回退 AKShare 全表: {e}")
+                logger.warning(f"Tickflow 个股行情失败，尝试 Tushare: {e}")
+
+        if self._tushare_token:
+            try:
+                from ..tushare_client import fetch_quote_realtime, quote_to_stock_fields
+
+                q = await asyncio.to_thread(
+                    fetch_quote_realtime, self._tushare_token, stock_code
+                )
+                if isinstance(q, dict) and q:
+                    self._current_source = "tushare"
+                    return StockInfo(**quote_to_stock_fields(q, stock_code))
+            except ImportError as e:
+                logger.warning(f"Tushare 未安装或不可导入，跳过该数据源: {e}")
+            except Exception as e:
+                logger.warning(f"Tushare 个股行情失败，回退 AKShare 全表: {e}")
 
         try:
             # 获取A股实时行情（使用缓存）
