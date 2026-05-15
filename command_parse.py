@@ -815,8 +815,23 @@ def parse_short_term_batch_tail(
 DABAN_NO_THS_KEYWORDS = frozenset({"不含同花顺", "无同花顺"})
 DABAN_NO_STEP_KEYWORDS = frozenset({"不含天梯", "无天梯"})
 DABAN_NO_LHB_KEYWORDS = frozenset({"不含龙虎榜", "无龙虎榜"})
-DABAN_EXCLUDE_BJ_KEYWORDS = frozenset({"去北交所", "剔除北交所"})
 DABAN_MODE_KEYWORDS = frozenset({"综合", "首板", "接力", "龙头"})
+
+
+def _parse_daban_board_filters(tail: str) -> tuple[list[str], bool, bool, bool, bool]:
+    """
+    打板命令默认剔除北交所、创业板、科创板、ST（与量化精选一致）。
+    可用 含北交/含创/含科技/含ST 恢复；显式 去* 与同条 含* 并存时以 去* 优先。
+    """
+    rest, exclude_bse, exclude_chinext, _lim, exclude_star, include_st = (
+        split_exchange_exclude_keyword_tokens(
+            tail,
+            default_exclude_bse=True,
+            default_exclude_chinext=True,
+            default_exclude_star=True,
+        )
+    )
+    return rest, exclude_bse, exclude_chinext, exclude_star, not include_st
 _DABAN_MODE_MAP = {
     "综合": "mixed",
     "首板": "shouban",
@@ -830,35 +845,30 @@ MAX_DABAN_TOP_N = 200
 
 def parse_daban_pick_tail(
     tail: str,
-) -> tuple[str | None, int, str, bool, bool, bool, bool, bool]:
+) -> tuple[str | None, int, str, bool, bool, bool, bool, bool, bool, bool]:
     """
     解析「打板选股」尾部。
 
     Returns:
         (trade_date, top_n, mode_str, want_ths, want_step, want_top_list,
-         exclude_bj, exclude_st)
-        mode_str: mixed | shouban | relay | dragon
+         exclude_bse, exclude_chinext, exclude_star, exclude_st)
     """
-    parts = (tail or "").split()
+    rest, exclude_bse, exclude_chinext, exclude_star, exclude_st = (
+        _parse_daban_board_filters(tail)
+    )
     trade_date: str | None = None
     top_n = DEFAULT_DABAN_TOP_N
     mode = "mixed"
     want_ths = True
     want_step = True
     want_top_list = True
-    exclude_bj = False
-    exclude_st = True
-    for p in parts:
+    for p in rest:
         if p in DABAN_NO_THS_KEYWORDS:
             want_ths = False
         elif p in DABAN_NO_STEP_KEYWORDS:
             want_step = False
         elif p in DABAN_NO_LHB_KEYWORDS:
             want_top_list = False
-        elif p in DABAN_EXCLUDE_BJ_KEYWORDS:
-            exclude_bj = True
-        elif p in INCLUDE_ST_KEYWORDS:
-            exclude_st = False
         elif p in DABAN_MODE_KEYWORDS:
             mode = _DABAN_MODE_MAP.get(p, mode)
         elif len(p) == 8 and p.isdigit():
@@ -878,7 +888,9 @@ def parse_daban_pick_tail(
         want_ths,
         want_step,
         want_top_list,
-        exclude_bj,
+        exclude_bse,
+        exclude_chinext,
+        exclude_star,
         exclude_st,
     )
 
@@ -894,41 +906,39 @@ def parse_daban_money_tail(
         want_ths,
         want_step,
         want_top_list,
-        exclude_bj,
+        exclude_bse,
+        _ec,
+        _es,
         _exclude_st,
     ) = parse_daban_pick_tail(tail)
-    return trade_date, top_n, want_ths, want_step, want_top_list, exclude_bj
+    return trade_date, top_n, want_ths, want_step, want_top_list, exclude_bse
 
 
 def parse_daban_pick_debate_tail(
     tail: str,
     *,
     max_debate_cap: int = MAX_QUANT_STOCK_DEBATE_CAP,
-) -> tuple[str | None, int, int, str, bool, bool, bool, bool, bool]:
+) -> tuple[str | None, int, int, str, bool, bool, bool, bool, bool, bool, bool]:
     """
     解析「打板选股多空」尾部：打板选股参数 + 辩论只数。
     正整数 1～2 个：top_n、辩论只数（未写第二项则 min(top_n, max_debate_cap)）。
     """
-    parts = (tail or "").split()
+    rest, exclude_bse, exclude_chinext, exclude_star, exclude_st = (
+        _parse_daban_board_filters(tail)
+    )
     trade_date: str | None = None
     mode = "mixed"
     want_ths = True
     want_step = True
     want_top_list = True
-    exclude_bj = False
-    exclude_st = True
     nums: list[int] = []
-    for p in parts:
+    for p in rest:
         if p in DABAN_NO_THS_KEYWORDS:
             want_ths = False
         elif p in DABAN_NO_STEP_KEYWORDS:
             want_step = False
         elif p in DABAN_NO_LHB_KEYWORDS:
             want_top_list = False
-        elif p in DABAN_EXCLUDE_BJ_KEYWORDS:
-            exclude_bj = True
-        elif p in INCLUDE_ST_KEYWORDS:
-            exclude_st = False
         elif p in DABAN_MODE_KEYWORDS:
             mode = _DABAN_MODE_MAP.get(p, mode)
         elif len(p) == 8 and p.isdigit():
@@ -959,7 +969,9 @@ def parse_daban_pick_debate_tail(
         want_ths,
         want_step,
         want_top_list,
-        exclude_bj,
+        exclude_bse,
+        exclude_chinext,
+        exclude_star,
         exclude_st,
     )
 

@@ -2837,7 +2837,8 @@ class FundAnalyzerPlugin(Star):
         yield event.plain_result(
             "「打板资金」已合并为「打板选股」。\n"
             "用法: 打板选股 [YYYYMMDD] [条数] [综合|首板|接力|龙头] "
-            "[不含同花顺] [不含天梯] [不含龙虎榜] [去北交所]\n"
+            "[不含同花顺] … 默认剔北交所/创业板/科创板/ST；"
+            "可用 含北交/含创/含科技/含ST 恢复\n"
             "示例: 打板选股 20250514 15 接力\n"
             "说明: 盘后涨停池评分选股，默认综合模式；建议 Tushare 积分≥8000。"
         )
@@ -2846,7 +2847,8 @@ class FundAnalyzerPlugin(Star):
     async def tushare_daban_pick_codes(self, event: AstrMessageEvent):
         """
         打板选股：涨停池 + 分位数综合评分，支持综合/首板/接力/龙头模式。
-        用法: 打板选股 [YYYYMMDD] [条数] [综合|首板|接力|龙头] …
+        用法: 打板选股 [YYYYMMDD] [条数] [模式] …
+        默认剔北交所、创业板、科创板、ST；含北交/含创/含科技/含ST 可恢复。
         未写日期用最近上交所开市日；盘后数据，供次日计划，非投资建议。
         """
         ts_tok = getattr(self.stock_analyzer, "_tushare_token", None)
@@ -2866,7 +2868,9 @@ class FundAnalyzerPlugin(Star):
                 want_ths,
                 want_step,
                 want_top_list,
-                exclude_bj,
+                exclude_bse,
+                exclude_chinext,
+                exclude_star,
                 exclude_st,
             ) = parse_daban_pick_tail(tail)
         except Exception as e:
@@ -2904,7 +2908,9 @@ class FundAnalyzerPlugin(Star):
                 top_n=top_n,
                 mode=mode,
                 exclude_st=exclude_st,
-                exclude_bj=exclude_bj,
+                exclude_bse=exclude_bse,
+                exclude_chinext=exclude_chinext,
+                exclude_star=exclude_star,
                 want_ths=want_ths,
                 want_step=want_step,
                 want_top_list=want_top_list,
@@ -2964,7 +2970,9 @@ class FundAnalyzerPlugin(Star):
                 want_ths,
                 want_step,
                 want_top_list,
-                exclude_bj,
+                exclude_bse,
+                exclude_chinext,
+                exclude_star,
                 exclude_st,
             ) = parse_daban_pick_debate_tail(tail)
         except Exception as e:
@@ -3003,7 +3011,9 @@ class FundAnalyzerPlugin(Star):
                 top_n=top_n,
                 mode=mode,
                 exclude_st=exclude_st,
-                exclude_bj=exclude_bj,
+                exclude_bse=exclude_bse,
+                exclude_chinext=exclude_chinext,
+                exclude_star=exclude_star,
                 want_ths=want_ths,
                 want_step=want_step,
                 want_top_list=want_top_list,
@@ -4671,7 +4681,7 @@ class FundAnalyzerPlugin(Star):
 🔹 量化精选股票 [候选数] [输出条数] [发图可选] [去北交所/含北交 …] … - |涨跌幅|前筛+排序（默认150/10）；默认**文本**结果；需图加「发图」等；默认剔除北交所、创业板、科创板（可用含*恢复）；「去涨停」为剔除涨跌幅>9%，默认关闭
 🔹 量化精选股票多空 [候选数] [输出条数] [智能分析上限] … - 同上筛选与剔除；第三数字可选；可选「涨停分析」；默认涨停跳过 LLM；成功行输出方向并附一行参考买入/止损价位（演示）
 🔹 量化精选仓位计划 [本金…] [候选数] [输出条数] [智能分析上限] … - 同上辩论流程；须指定本金（如本金100万）；可选「涨停分析」；可选 风险1%/风险0.01、止损2ATR、分0.7、额均2亿、单票20%、最多5只；输出结构化快照（score/ts/日K对齐）与整手仓位演示+JSON（非投资建议）
-🔹 打板选股 [YYYYMMDD] [条数] [综合|首板|接力|龙头] … - 涨停池分位数评分；A/B档；末行A档代码串；可写「不含同花顺」「不含天梯」「不含龙虎榜」「去北交所」；须 tushare_token；建议积分≥8000；盘后复盘用
+🔹 打板选股 [YYYYMMDD] [条数] [模式] … - 默认剔北交所/创业板/科创板/ST；含北交/含创/含科技/含ST可恢复；须 tushare_token；建议积分≥8000
 🔹 打板选股多空 [YYYYMMDD] [条数] [辩论只数] [模式…] … - 对A档前K只辩论（K≤15）；结论含参考买入/止损（演示）；须 LLM+tushare_token
 🔹 打板资金 - 已合并为「打板选股」，输入会提示新用法
 🔹 打板查股 <代码或ts_code> [YYYYMMDD可选] - 输出当日行情+涨停池信息+资金流向分档（DC）；须 tushare_token

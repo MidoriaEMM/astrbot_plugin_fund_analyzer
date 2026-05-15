@@ -81,7 +81,9 @@ class DabanPickConfig:
     top_n: int = 15
     mode: DabanPickMode = DabanPickMode.MIXED
     exclude_st: bool = True
-    exclude_bj: bool = False
+    exclude_bse: bool = True
+    exclude_chinext: bool = True
+    exclude_star: bool = True
     want_ths: bool = True
     want_step: bool = True
     want_top_list: bool = True
@@ -129,6 +131,60 @@ def _to_float(x: Any, default: float = 0.0) -> float:
 
 def _is_st_name(name: str) -> bool:
     return bool(re.search(r"\bST\b", name, flags=re.I)) or "ST" in name.upper()
+
+
+def _code6_from_ts_code(ts_code: str) -> str:
+    s = str(ts_code or "").strip().upper()
+    if "." in s:
+        s = s.split(".", 1)[0]
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if len(digits) >= 6:
+        return digits[-6:].zfill(6)
+    return digits.zfill(6) if digits else ""
+
+
+def _is_beijing_code(code6: str) -> bool:
+    c = (code6 or "").zfill(6)
+    return any(c.startswith(p) for p in ("43", "83", "87", "88", "92"))
+
+
+def _is_chinext_code(code6: str) -> bool:
+    c = (code6 or "").zfill(6)
+    return len(c) == 6 and c.startswith("30")
+
+
+def _is_star_code(code6: str) -> bool:
+    c = (code6 or "").zfill(6)
+    return c.startswith("688") or c.startswith("689")
+
+
+def board_filter_note(cfg: DabanPickConfig) -> str:
+    """当前板块过滤说明（用于输出 meta）。"""
+    on: list[str] = []
+    if cfg.exclude_bse:
+        on.append("北交所")
+    if cfg.exclude_chinext:
+        on.append("创业板")
+    if cfg.exclude_star:
+        on.append("科创板")
+    if cfg.exclude_st:
+        on.append("ST")
+    if not on:
+        return "未剔除板块"
+    return "已剔: " + "/".join(on)
+
+
+def _should_skip_candidate(code: str, name: str, cfg: DabanPickConfig) -> bool:
+    if cfg.exclude_st and name and _is_st_name(name):
+        return True
+    c6 = _code6_from_ts_code(code)
+    if cfg.exclude_bse and (code.upper().endswith(".BJ") or _is_beijing_code(c6)):
+        return True
+    if cfg.exclude_chinext and _is_chinext_code(c6):
+        return True
+    if cfg.exclude_star and _is_star_code(c6):
+        return True
+    return False
 
 
 def _dc_tier_sum_wan(fl_row: dict[str, Any]) -> float:
@@ -341,9 +397,7 @@ def enrich_limit_pool(
         if not code:
             continue
         name = str(_pick(lu, "name") or "")
-        if cfg.exclude_st and name and _is_st_name(name):
-            continue
-        if cfg.exclude_bj and code.endswith(".BJ"):
+        if _should_skip_candidate(code, name, cfg):
             continue
 
         fl = flow_by.get(code, {})
@@ -428,6 +482,7 @@ def run_daban_pick_pipeline(
                 "mode": cfg.mode.value,
                 "n_a": sum(1 for r in out if r.get("tier") == "A"),
                 "n_b": sum(1 for r in out if r.get("tier") == "B"),
+                "board_filter": board_filter_note(cfg),
             }
         )
     return out

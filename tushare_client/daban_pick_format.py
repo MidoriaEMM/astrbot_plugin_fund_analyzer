@@ -40,6 +40,7 @@ def format_daban_pick_v2(
     n_after_mode = int(st.get("n_after_mode", 0))
     n_scored = int(st.get("n_scored", 0))
     regime = str(st.get("market_regime", "-"))
+    board_f = str(st.get("board_filter", ""))
     mode_s = mode_label(mode)
 
     if not rows:
@@ -47,11 +48,13 @@ def format_daban_pick_v2(
             f"打板选股 {trade_date} [{mode_s}] 无结果\n"
             f"涨停池 {n_limit} 只 → 模式过滤 {n_after_mode} 只 → 评分 {n_scored} 只\n"
             f"盘面: {regime}"
+            + (f" | {board_f}" if board_f else "")
         )
 
     lines = [
         f"打板选股 {trade_date} [{mode_s}] 盘面={regime}",
-        f"涨停池{n_limit}→模式过滤{n_after_mode}→评分{n_scored}→输出{len(rows)}只",
+        f"涨停池{n_limit}→模式过滤{n_after_mode}→评分{n_scored}→输出{len(rows)}只"
+        + (f" | {board_f}" if board_f else ""),
         "排序: 综合分↓ | 分档 A=优先 B=观察",
         "━━━━━━━━━━━━━━━━━━━━━━━━",
     ]
