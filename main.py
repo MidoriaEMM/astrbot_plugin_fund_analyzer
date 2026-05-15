@@ -51,6 +51,10 @@ from .command_parse import (
     DEFAULT_SHORT_TERM_BATCH_TOP,
     MAX_QUANT_STOCK_DEBATE_CAP,
     get_event_plain_text,
+    parse_daban_pick_tail,
+    parse_daban_check_stock_tail,
+    parse_daban_pick_debate_tail,
+    parse_stock_backtest_tail,
     parse_keyword_and_limit,
     parse_name_maxscan_top,
     parse_quant_stock_screen_debate_tail,
@@ -62,6 +66,7 @@ from .command_parse import (
     parse_wyckoff_batch_tail,
     parse_wyckoff_screen_tail,
     strip_command_prefix,
+    ts_code_to_fund_debate_code,
 )
 
 # 导入本地图片生成器
@@ -2415,10 +2420,11 @@ class FundAnalyzerPlugin(Star):
     async def quant_screen_stocks_debate_plain(self, event: AstrMessageEvent):
         """
         与「量化精选股票」相同筛股排序后，对前若干只依次执行「股票智能分析」，仅输出纯文本多空结论。
-        用法: 量化精选股票多空 [候选只数] [输出条数] [智能分析只数上限] [板块/涨停/ST 关键词 …]（第三个数字可选）
+        用法: 量化精选股票多空 [候选只数] [输出条数] [智能分析只数上限] [板块/涨停/ST/涨停分析 …]（第三个数字可选）
         智能分析只数为 min(第三个数字, 输出条数, 全局上限)；未写第三个数字时为 min(输出条数, 全局上限)。
         剔除关键词、默认板块范围与「量化精选股票」相同（默认剔北交所/创业板/科创板，可用含*恢复）。
-        智能分析前会按板块（ST/双创/北交所等）再判涨停：涨停则跳过 LLM，仅输出「涨停」。
+        默认：按板块近似判涨停则跳过 LLM，仅输出「涨停」。写「涨停分析」时涨停标的也跑多智能体辩论。
+        成功行在方向后附精简「参考买入/止损」价位演示（规则化，非投资建议）。
         """
         try:
             if not self.context.get_using_provider():
@@ -2440,6 +2446,7 @@ class FundAnalyzerPlugin(Star):
                 exclude_limit_up,
                 exclude_star,
                 exclude_st,
+                debate_on_limit_up,
             ) = parse_quant_stock_screen_debate_tail(tail)
 
             ex_notes: list[str] = []
@@ -2461,11 +2468,17 @@ class FundAnalyzerPlugin(Star):
             if not exclude_st:
                 ex_suffix += "；含风险警示股"
 
+            zt_llm_note = (
+                "涨停标的同样参与智能分析（约 9 次 LLM/只）。\n"
+                if debate_on_limit_up
+                else "涨停标的跳过 LLM。\n"
+            )
             yield event.plain_result(
                 f"⚖️ 量化精选股票多空{ex_suffix}：候选至多 {max_scan} 只 → TOP {top_n} → "
                 f"依次智能分析前 {debate_cap} 只（每只约 9 次 LLM，约 3～5 分钟；单指令上限 "
-                f"{MAX_QUANT_STOCK_DEBATE_CAP} 只）。涨停标的跳过 LLM。\n"
-                "下面每条形如：代码 名称 看涨/看跌/中性（当前 ±x.xx%）（涨停亦附当前涨跌幅）"
+                f"{MAX_QUANT_STOCK_DEBATE_CAP} 只）。{zt_llm_note}"
+                "下面每条形如：代码 名称 看涨/看跌/中性（当前 ±x.xx%）；"
+                "成功行另附一行参考买入/止损价位（演示）。"
             )
 
             raw, attempted = await screen_stocks_by_abs_pct(
@@ -2504,6 +2517,8 @@ class FundAnalyzerPlugin(Star):
 
             self.stock_analyzer.invalidate_stock_cache()
 
+            from .stock.debate_trade_hint import format_trade_levels_lines
+
             ok_n = 0
             fail_n = 0
             skip_zt_n = 0
@@ -2513,8 +2528,12 @@ class FundAnalyzerPlugin(Star):
                 pct_txt = (
                     f"（当前 {rt.change_rate:+.2f}%）" if rt is not None else ""
                 )
-                if rt is not None and is_effectively_limit_up(
-                    rt.code, rt.name, rt.change_rate
+                if (
+                    not debate_on_limit_up
+                    and rt is not None
+                    and is_effectively_limit_up(
+                        rt.code, rt.name, rt.change_rate
+                    )
                 ):
                     skip_zt_n += 1
                     yield event.plain_result(
@@ -2522,10 +2541,11 @@ class FundAnalyzerPlugin(Star):
                     )
                     continue
 
-                debate_result, _info, err, _align = await self._run_debate_pipeline_for_code(
+                debate_result, _info, err, align = await self._run_debate_pipeline_for_code(
                     row.code,
                     False,
                     progress_callback=None,
+                    with_alignment=True,
                 )
                 if err:
                     fail_n += 1
@@ -2537,8 +2557,20 @@ class FundAnalyzerPlugin(Star):
                     ok_n += 1
                     d = debate_result.final_direction
                     label = d if d in dir_ok else "中性"
+                    align_dict = (
+                        align.as_alignment_dict()
+                        if align is not None
+                        and hasattr(align, "as_alignment_dict")
+                        else None
+                    )
+                    hints = format_trade_levels_lines(
+                        direction=label,
+                        latest_price=float(debate_result.stock_price or 0.0),
+                        alignment=align_dict,
+                    )
+                    hint_one = " ".join(h for h in hints if h)
                     yield event.plain_result(
-                        f"{row.code} {row.name} {label}{pct_txt}"
+                        f"{row.code} {row.name} {label}{pct_txt}\n{hint_one}"
                     )
 
             yield event.plain_result(
@@ -2562,7 +2594,7 @@ class FundAnalyzerPlugin(Star):
         与「量化精选股票多空」同源筛股与辩论；额外解析本金与风控参数，输出结构化快照与日 K 对齐指标，
         并按 score 加权给出整手仓位演示（不构成投资建议）。
         用法示例：量化精选仓位计划 本金100万 150 10 3 风险1% 止损2ATR 分0.7 额均2亿 单票20% 最多5只 去涨停
-        （筛股板块默认与「量化精选股票」相同：默认剔北交所/创业板/科创板。）
+        （筛股板块默认与「量化精选股票」相同：默认剔北交所/创业板/科创板。）可选「涨停分析」使涨停标的也跑辩论。
         """
         try:
             if not self.context.get_using_provider():
@@ -2584,6 +2616,7 @@ class FundAnalyzerPlugin(Star):
                 exclude_limit_up,
                 exclude_star,
                 exclude_st,
+                debate_on_limit_up,
                 principal,
                 risk_fraction,
                 k_atr,
@@ -2597,7 +2630,7 @@ class FundAnalyzerPlugin(Star):
                 yield event.plain_result(
                     "❌ 请在尾部指定本金，例如：本金100万、本金50w、本金1000000（元）\n"
                     "💡 可选：风险1% 或 风险0.01 | 止损2ATR | 分0.7 | 额均2亿 | 单票20% | 最多5只\n"
-                    "（其余数字与板块/涨停/ST 关键词与「量化精选股票多空」相同；默认剔北交所、创业板、科创板。）"
+                    "（其余数字与板块/涨停/ST/涨停分析 等关键词与「量化精选股票多空」相同；默认剔北交所、创业板、科创板。）"
                 )
                 return
 
@@ -2627,8 +2660,12 @@ class FundAnalyzerPlugin(Star):
                 f"额均≥{min_avg_amount_yi}亿 单票上限={single_cap_fraction:.2%}"
                 f"{'' if max_positions is None else f' 最多{max_positions}只'}\n"
                 f"候选至多 {max_scan} → TOP {top_n} → 辩论前 {debate_cap} 只（每只约 9 次 LLM）。"
-                f"涨停跳过 LLM。\n"
-                "每条形如：代码 名称 dir=… score=… bar=… atr=… 额均=… ts=…"
+                + (
+                    "涨停标的同样参与智能分析。\n"
+                    if debate_on_limit_up
+                    else "涨停跳过 LLM。\n"
+                )
+                + "每条形如：代码 名称 dir=… score=… bar=… atr=… 额均=… ts=…"
             )
 
             raw, attempted = await screen_stocks_by_abs_pct(
@@ -2677,8 +2714,12 @@ class FundAnalyzerPlugin(Star):
                 pct_txt = (
                     f"（当前 {rt.change_rate:+.2f}%）" if rt is not None else ""
                 )
-                if rt is not None and is_effectively_limit_up(
-                    rt.code, rt.name, rt.change_rate
+                if (
+                    not debate_on_limit_up
+                    and rt is not None
+                    and is_effectively_limit_up(
+                        rt.code, rt.name, rt.change_rate
+                    )
                 ):
                     skip_zt_n += 1
                     yield event.plain_result(
@@ -2788,6 +2829,496 @@ class FundAnalyzerPlugin(Star):
             )
         except Exception as e:
             logger.error(f"量化精选仓位计划出错: {e}")
+            yield event.plain_result(f"❌ 执行失败: {e}")
+
+    @filter.command("打板资金")
+    async def tushare_daban_limit_flow_migrate(self, event: AstrMessageEvent):
+        """已合并至「打板选股」。"""
+        yield event.plain_result(
+            "「打板资金」已合并为「打板选股」。\n"
+            "用法: 打板选股 [YYYYMMDD] [条数] [综合|首板|接力|龙头] "
+            "[不含同花顺] [不含天梯] [不含龙虎榜] [去北交所]\n"
+            "示例: 打板选股 20250514 15 接力\n"
+            "说明: 盘后涨停池评分选股，默认综合模式；建议 Tushare 积分≥8000。"
+        )
+
+    @filter.command("打板选股")
+    async def tushare_daban_pick_codes(self, event: AstrMessageEvent):
+        """
+        打板选股：涨停池 + 分位数综合评分，支持综合/首板/接力/龙头模式。
+        用法: 打板选股 [YYYYMMDD] [条数] [综合|首板|接力|龙头] …
+        未写日期用最近上交所开市日；盘后数据，供次日计划，非投资建议。
+        """
+        ts_tok = getattr(self.stock_analyzer, "_tushare_token", None)
+        if not (ts_tok or "").strip():
+            yield event.plain_result(
+                "❌ 未配置 Tushare token\n"
+                "💡 请在插件配置填写 tushare_token 或设置环境变量 TUSHARE_TOKEN"
+            )
+            return
+
+        tail = strip_command_prefix(get_event_plain_text(event), "打板选股")
+        try:
+            (
+                trade_date_in,
+                top_n,
+                mode_str,
+                want_ths,
+                want_step,
+                want_top_list,
+                exclude_bj,
+                exclude_st,
+            ) = parse_daban_pick_tail(tail)
+        except Exception as e:
+            yield event.plain_result(f"❌ 参数解析失败: {e}")
+            return
+
+        try:
+            from .tushare_client.daban_pick_engine import (
+                DabanPickConfig,
+                DabanPickMode,
+                fetch_daban_pick,
+            )
+            from .tushare_client.daban_pick_format import format_daban_pick_v2
+            from .tushare_client.limit_up_fetch import fetch_last_sse_trade_date
+
+            try:
+                mode = DabanPickMode(mode_str)
+            except ValueError:
+                mode = DabanPickMode.MIXED
+
+            if trade_date_in:
+                trade_date = trade_date_in
+            else:
+                resolved = await asyncio.to_thread(
+                    fetch_last_sse_trade_date, ts_tok
+                )
+                if not resolved:
+                    yield event.plain_result(
+                        "❌ 无法解析默认交易日，请显式传入 YYYYMMDD。"
+                    )
+                    return
+                trade_date = resolved
+
+            cfg = DabanPickConfig(
+                top_n=top_n,
+                mode=mode,
+                exclude_st=exclude_st,
+                exclude_bj=exclude_bj,
+                want_ths=want_ths,
+                want_step=want_step,
+                want_top_list=want_top_list,
+            )
+
+            def _run():
+                return fetch_daban_pick(ts_tok, trade_date, cfg)
+
+            rows, stats = await asyncio.to_thread(_run)
+            body = format_daban_pick_v2(
+                rows, trade_date=trade_date, mode=mode, stats=stats
+            )
+            yield event.plain_result(
+                body
+                + "\n━━━━━━━━━━━━━━━━━━━━\n"
+                "⚠️ 盘后涨停池评分；资金以东财 moneyflow_dc 为准；非投资建议。\n"
+                + DISCLAIMER.strip()
+            )
+        except ValueError as e:
+            yield event.plain_result(f"❌ {e}")
+        except Exception as e:
+            logger.error(f"打板选股出错: {e}")
+            yield event.plain_result(
+                f"❌ 执行失败: {e}\n"
+                "💡 若提示权限/积分不足，请核对 Tushare 积分（建议≥8000）。"
+            )
+
+    @filter.command("打板选股多空")
+    async def tushare_daban_pick_debate(self, event: AstrMessageEvent):
+        """
+        打板选股 A 档后对前 K 只多智能体辩论。
+        用法: 打板选股多空 [YYYYMMDD] [条数] [辩论只数] [综合|首板|接力|龙头] …
+        未写辩论只数时 min(条数, 15)；每只约 9 次 LLM。
+        """
+        if not self.context.get_using_provider():
+            yield event.plain_result(
+                "❌ 未配置大模型提供商\n"
+                "💡 请在 AstrBot 管理面板配置 LLM 提供商后再试"
+            )
+            return
+
+        ts_tok = getattr(self.stock_analyzer, "_tushare_token", None)
+        if not (ts_tok or "").strip():
+            yield event.plain_result(
+                "❌ 未配置 Tushare token\n"
+                "💡 请在插件配置填写 tushare_token 或设置环境变量 TUSHARE_TOKEN"
+            )
+            return
+
+        tail = strip_command_prefix(get_event_plain_text(event), "打板选股多空")
+        try:
+            (
+                trade_date_in,
+                top_n,
+                debate_cap,
+                mode_str,
+                want_ths,
+                want_step,
+                want_top_list,
+                exclude_bj,
+                exclude_st,
+            ) = parse_daban_pick_debate_tail(tail)
+        except Exception as e:
+            yield event.plain_result(f"❌ 参数解析失败: {e}")
+            return
+
+        try:
+            from .tushare_client.daban_pick_engine import (
+                DabanPickConfig,
+                DabanPickMode,
+                fetch_daban_pick,
+                mode_label,
+            )
+            from .tushare_client.limit_up_fetch import fetch_last_sse_trade_date
+            from .stock.debate_engine import DebateEngine
+
+            try:
+                mode = DabanPickMode(mode_str)
+            except ValueError:
+                mode = DabanPickMode.MIXED
+
+            if trade_date_in:
+                trade_date = trade_date_in
+            else:
+                resolved = await asyncio.to_thread(
+                    fetch_last_sse_trade_date, ts_tok
+                )
+                if not resolved:
+                    yield event.plain_result(
+                        "❌ 无法解析默认交易日，请显式传入 YYYYMMDD。"
+                    )
+                    return
+                trade_date = resolved
+
+            cfg = DabanPickConfig(
+                top_n=top_n,
+                mode=mode,
+                exclude_st=exclude_st,
+                exclude_bj=exclude_bj,
+                want_ths=want_ths,
+                want_step=want_step,
+                want_top_list=want_top_list,
+            )
+
+            def _run_merge():
+                return fetch_daban_pick(ts_tok, trade_date, cfg)
+
+            merged, stats = await asyncio.to_thread(_run_merge)
+            a_rows = [r for r in merged if str(r.get("tier", "")).upper() == "A"]
+            targets = a_rows[:debate_cap]
+            if not targets:
+                yield event.plain_result(
+                    f"{trade_date} [{mode_label(mode)}] 无 A 档候选可辩论。"
+                    + DISCLAIMER
+                )
+                return
+
+            yield event.plain_result(
+                f"打板选股多空 {trade_date} 模式={mode_label(mode)} "
+                f"盘面={stats.get('market_regime', '-')} | "
+                f"涨停池{stats.get('n_limit', 0)}→过滤{stats.get('n_after_mode', 0)}"
+                f"→评分{stats.get('n_scored', 0)} | A档{stats.get('n_a', len(a_rows))}只 "
+                f"辩论前{len(targets)}只（约9次LLM/只）"
+            )
+
+            engine = DebateEngine(self.context)
+            ok_n = 0
+            fail_n = 0
+            dir_ok = frozenset({"看涨", "看跌", "中性"})
+            for row in targets:
+                ts_code = str(row.get("ts_code") or "").strip()
+                name = str(row.get("name") or "")
+                fund_code = ts_code_to_fund_debate_code(ts_code)
+                if not fund_code:
+                    fail_n += 1
+                    yield event.plain_result(f"{ts_code} {name} 失败：代码无效")
+                    continue
+                debate_result, _info, err, align = (
+                    await self._run_debate_pipeline_for_code(
+                        fund_code,
+                        False,
+                        progress_callback=None,
+                        with_alignment=True,
+                    )
+                )
+                if err:
+                    fail_n += 1
+                    short = (err.strip().split("\n") or [err])[0].strip()
+                    yield event.plain_result(
+                        f"{ts_code} {name} 失败：{short}"
+                    )
+                else:
+                    ok_n += 1
+                    d = debate_result.final_direction
+                    label = d if d in dir_ok else "中性"
+                    align_dict = (
+                        align.as_alignment_dict()
+                        if align is not None
+                        and hasattr(align, "as_alignment_dict")
+                        else None
+                    )
+                    summary = engine.format_debate_summary(
+                        debate_result, alignment_dict=align_dict
+                    )
+                    yield event.plain_result(
+                        f"━━ {ts_code} {name} {label} ━━\n{summary}"
+                    )
+
+            yield event.plain_result(
+                f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"完成：成功 {ok_n} 条，失败 {fail_n} 条。\n"
+                f"{DISCLAIMER.strip()}"
+            )
+        except ValueError as e:
+            yield event.plain_result(f"❌ {e}")
+        except Exception as e:
+            logger.error(f"打板选股多空出错: {e}")
+            yield event.plain_result(f"❌ 执行失败: {e}")
+
+    @filter.command("股票回测")
+    async def stock_equity_backtest(self, event: AstrMessageEvent):
+        """
+        A 股区间回测：买入持有（≥2 交易日）+ 可选 MA/RSI/MACD 策略。
+        用法: 股票回测 <代码> <YYYYMMDD-YYYYMMDD> [仅基准|含策略]
+        默认短区间仅基准；≥40 交易日自动含策略。示例:
+        股票回测 600519 20240101-20240115
+        股票回测 600519 20240101-20240630 含策略
+        """
+        tail = strip_command_prefix(get_event_plain_text(event), "股票回测")
+        try:
+            code_raw, start_date, end_date, strategy_mode_str = (
+                parse_stock_backtest_tail(tail)
+            )
+        except ValueError as e:
+            yield event.plain_result(f"❌ {e}")
+            return
+
+        try:
+            from datetime import datetime
+
+            from .stock.equity_backtest import (
+                EquityBacktestConfig,
+                MIN_BARS_INTERVAL,
+                StrategyMode,
+                build_equity_backtest_report,
+                filter_history_by_date_range,
+                format_equity_backtest_report,
+            )
+            from .tushare_client.klines import fetch_daily_klines_date_range
+            from .tushare_client.symbols import normalize_tickflow_symbol
+
+            ts_code = normalize_tickflow_symbol(code_raw)
+            code6 = ts_code_to_fund_debate_code(ts_code)
+            if not code6:
+                yield event.plain_result("❌ 股票代码无效")
+                return
+
+            try:
+                strategy_mode = StrategyMode(strategy_mode_str)
+            except ValueError:
+                strategy_mode = StrategyMode.AUTO
+            bt_cfg = EquityBacktestConfig(strategy_mode=strategy_mode)
+
+            ts_tok = getattr(self.stock_analyzer, "_tushare_token", None)
+            range_label = f"{start_date}-{end_date}"
+            yield event.plain_result(
+                f"📊 正在回测 {ts_code} 区间 {range_label}…"
+            )
+
+            history = None
+            if (ts_tok or "").strip():
+                try:
+                    history = await asyncio.to_thread(
+                        fetch_daily_klines_date_range,
+                        ts_tok,
+                        ts_code,
+                        start_date,
+                        end_date,
+                        "qfq",
+                        min_bars=MIN_BARS_INTERVAL,
+                    )
+                except Exception as e:
+                    logger.warning(f"Tushare 区间 K 线失败: {e}")
+
+            if not history:
+                try:
+                    d0 = datetime.strptime(start_date, "%Y%m%d")
+                    d1 = datetime.strptime(end_date, "%Y%m%d")
+                    span_days = max((d1 - d0).days + 60, 90)
+                except ValueError:
+                    span_days = 365
+                em_hist = await get_eastmoney_api().get_fund_history(
+                    code6, days=span_days, adjust="qfq"
+                )
+                if em_hist:
+                    history = filter_history_by_date_range(
+                        em_hist, start_date, end_date
+                    )
+
+            if not history or len(history) < MIN_BARS_INTERVAL:
+                yield event.plain_result(
+                    f"❌ 区间 {range_label} 有效交易日不足（需≥{MIN_BARS_INTERVAL} 天）\n"
+                    "💡 请检查代码、日期是否为交易日，或配置 tushare_token 后重试"
+                )
+                return
+
+            name = ts_code
+            try:
+                rt = await self.stock_analyzer.get_stock_realtime(ts_code)
+                if rt and rt.name:
+                    name = rt.name
+            except Exception:
+                pass
+
+            report = build_equity_backtest_report(
+                history,
+                ts_code=ts_code,
+                name=name,
+                start_date=start_date,
+                end_date=end_date,
+                config=bt_cfg,
+            )
+            body = format_equity_backtest_report(report)
+            yield event.plain_result(
+                body
+                + "\n━━━━━━━━━━━━━━━━━━━━\n"
+                "⚠️ 历史回测基于盘后日 K，不代表未来表现。\n"
+                + DISCLAIMER.strip()
+            )
+        except ValueError as e:
+            yield event.plain_result(f"❌ {e}")
+        except Exception as e:
+            logger.error(f"股票回测出错: {e}")
+            yield event.plain_result(f"❌ 执行失败: {e}")
+
+    @filter.command("打板查股")
+    async def tushare_daban_check_stock(self, event: AstrMessageEvent):
+        """
+        打板查股：输入代码，输出该票当日基本信息、涨停/开板/封单、资金流向等。
+        用法: 打板查股 <代码或ts_code> [YYYYMMDD]
+        示例: 打板查股 000001.SZ 20250514
+        """
+        ts_tok = getattr(self.stock_analyzer, "_tushare_token", None)
+        if not (ts_tok or "").strip():
+            yield event.plain_result(
+                "❌ 未配置 Tushare token\n"
+                "💡 请在插件配置填写 tushare_token 或设置环境变量 TUSHARE_TOKEN"
+            )
+            return
+
+        tail = strip_command_prefix(get_event_plain_text(event), "打板查股")
+        trade_date_in, code_raw = parse_daban_check_stock_tail(tail)
+        if not code_raw:
+            yield event.plain_result(
+                "❌ 请输入股票代码\n💡 用法: 打板查股 <代码或ts_code> [YYYYMMDD]"
+            )
+            return
+
+        try:
+            from .tushare_client.limit_up_fetch import (
+                fetch_last_sse_trade_date,
+                fetch_limit_list_d_one,
+                fetch_moneyflow_dc_one,
+            )
+            from .tushare_client.symbols import normalize_tickflow_symbol
+
+            if trade_date_in:
+                trade_date = trade_date_in
+            else:
+                resolved = await asyncio.to_thread(
+                    fetch_last_sse_trade_date, ts_tok
+                )
+                if not resolved:
+                    yield event.plain_result(
+                        "❌ 无法解析默认交易日，请显式传入 YYYYMMDD。"
+                    )
+                    return
+                trade_date = resolved
+
+            ts_code = normalize_tickflow_symbol(code_raw)
+            code6 = ts_code_to_fund_debate_code(ts_code)
+
+            rt = await self.stock_analyzer.get_stock_realtime(ts_code)
+            limit_row = await asyncio.to_thread(
+                fetch_limit_list_d_one, ts_tok, trade_date, ts_code
+            )
+            flow_row = await asyncio.to_thread(
+                fetch_moneyflow_dc_one, ts_tok, trade_date, ts_code
+            )
+
+            lines: list[str] = []
+            lines.append(f"🔎 打板查股 {trade_date} {ts_code}")
+            lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+
+            if rt is not None:
+                lines.append(
+                    f"名称: {rt.name} 现价: {rt.latest_price:.3f} 涨跌幅: {rt.change_rate:+.2f}%"
+                )
+                lines.append(
+                    f"今开: {rt.open_price:.3f} 最高: {rt.high_price:.3f} 最低: {rt.low_price:.3f} 昨收: {rt.prev_close:.3f}"
+                )
+                lines.append(
+                    f"成交额: {rt.amount/1e8:.2f}亿 换手: {rt.turnover_rate:.2f}% 来源: {getattr(self.stock_analyzer, '_current_source', '-')}"
+                )
+            else:
+                lines.append("行情: ⚠️ 未取到实时行情（可稍后重试）")
+
+            if limit_row:
+                open_times = limit_row.get("open_times")
+                fd_amount = limit_row.get("fd_amount")
+                limit_times = limit_row.get("limit_times")
+                first_time = limit_row.get("first_time") or "-"
+                last_time = limit_row.get("last_time") or "-"
+                lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+                lines.append(
+                    "涨停池: "
+                    f"连板={limit_times} 开板={open_times} 封单额={fd_amount} 首封={first_time} 末封={last_time}"
+                )
+            else:
+                lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+                lines.append("涨停池: (limit_list_d) 未命中（可能非涨停/无数据/权限不足）")
+
+            if flow_row:
+                net_amount = flow_row.get("net_amount")
+                net_rate = flow_row.get("net_amount_rate")
+                elg = flow_row.get("buy_elg_amount")
+                lg = flow_row.get("buy_lg_amount")
+                md = flow_row.get("buy_md_amount")
+                sm = flow_row.get("buy_sm_amount")
+                tier_sum = 0.0
+                for x in (elg, lg, md, sm):
+                    try:
+                        tier_sum += float(x)
+                    except Exception:
+                        pass
+                lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+                lines.append(
+                    f"资金(东财/DC): 主力净流入={net_amount}万 占比={net_rate}% 分档累加={tier_sum:.2f}万"
+                )
+                lines.append(
+                    f"  超大={elg}万 大={lg}万 中={md}万 小={sm}万"
+                )
+            else:
+                lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+                lines.append("资金(东财/DC): ⚠️ 未取到 moneyflow_dc（可能无数据/权限不足/非交易日）")
+
+            lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+            lines.append("⚠️ 以上为数据汇总与规则化展示，不构成投资建议。")
+            yield event.plain_result("\n".join(lines))
+
+        except ValueError as e:
+            yield event.plain_result(f"❌ {e}")
+        except Exception as e:
+            logger.error(f"打板查股出错: {e}")
             yield event.plain_result(f"❌ 执行失败: {e}")
 
     @filter.command("短线选股")
@@ -3632,7 +4163,7 @@ class FundAnalyzerPlugin(Star):
         """
         多智能体博弈分析（6 Agent + 多空辩论 + 博弈论裁定）
         用法: 股票智能分析 [基金/股票代码] [发图|出图|要图|图片] [详进度|详细进度|显示进度]
-        默认仅输出结论文本；需 HTML 报告图时在尾部加「发图」等关键词；「详进度」可输出各阶段说明。
+        默认仅输出结论文本（含参考买入/止损价位演示）；需 HTML 报告图时在尾部加「发图」等关键词；「详进度」可输出各阶段说明。
         示例: 股票智能分析 161226、股票智能分析 600519 发图
         """
         try:
@@ -3663,6 +4194,7 @@ class FundAnalyzerPlugin(Star):
                 prefer_otc,
                 normalized_explicit_code=normalized_code,
                 progress_callback=on_progress,
+                with_alignment=True,
             )
             if err:
                 yield event.plain_result(err)
@@ -3671,7 +4203,14 @@ class FundAnalyzerPlugin(Star):
             from .stock.debate_engine import DebateEngine
 
             engine = DebateEngine(self.context)
-            summary = engine.format_debate_summary(debate_result)
+            align_dict = (
+                _align.as_alignment_dict()
+                if _align is not None and hasattr(_align, "as_alignment_dict")
+                else None
+            )
+            summary = engine.format_debate_summary(
+                debate_result, alignment_dict=align_dict
+            )
 
             if want_verbose_progress and progress_messages:
                 yield event.plain_result("\n".join(progress_messages))
@@ -4130,8 +4669,13 @@ class FundAnalyzerPlugin(Star):
 🔹 基金对比 [代码1] [代码2] - ⚖️对比两只基金
 🔹 量化精选基金 [分析上限] [输出条数] - 场内 LOF 列表批量量化排序（默认单页/top10，非投资建议）
 🔹 量化精选股票 [候选数] [输出条数] [发图可选] [去北交所/含北交 …] … - |涨跌幅|前筛+排序（默认150/10）；默认**文本**结果；需图加「发图」等；默认剔除北交所、创业板、科创板（可用含*恢复）；「去涨停」为剔除涨跌幅>9%，默认关闭
-🔹 量化精选股票多空 [候选数] [输出条数] [智能分析上限] … - 同上筛选与剔除；第三数字可选，限制「股票智能分析」只数（默认不超过输出条数且单指令至多15只）；智能分析前按板块再判涨停，涨停跳过 LLM 仅输出说明；其余依次输出「代码 名称 看涨/看跌/中性」纯文本
-🔹 量化精选仓位计划 [本金…] [候选数] [输出条数] [智能分析上限] … - 同上辩论流程；须指定本金（如本金100万）；可选 风险1%/风险0.01、止损2ATR、分0.7、额均2亿、单票20%、最多5只；输出结构化快照（score/ts/日K对齐）与整手仓位演示+JSON（非投资建议）
+🔹 量化精选股票多空 [候选数] [输出条数] [智能分析上限] … - 同上筛选与剔除；第三数字可选；可选「涨停分析」；默认涨停跳过 LLM；成功行输出方向并附一行参考买入/止损价位（演示）
+🔹 量化精选仓位计划 [本金…] [候选数] [输出条数] [智能分析上限] … - 同上辩论流程；须指定本金（如本金100万）；可选「涨停分析」；可选 风险1%/风险0.01、止损2ATR、分0.7、额均2亿、单票20%、最多5只；输出结构化快照（score/ts/日K对齐）与整手仓位演示+JSON（非投资建议）
+🔹 打板选股 [YYYYMMDD] [条数] [综合|首板|接力|龙头] … - 涨停池分位数评分；A/B档；末行A档代码串；可写「不含同花顺」「不含天梯」「不含龙虎榜」「去北交所」；须 tushare_token；建议积分≥8000；盘后复盘用
+🔹 打板选股多空 [YYYYMMDD] [条数] [辩论只数] [模式…] … - 对A档前K只辩论（K≤15）；结论含参考买入/止损（演示）；须 LLM+tushare_token
+🔹 打板资金 - 已合并为「打板选股」，输入会提示新用法
+🔹 打板查股 <代码或ts_code> [YYYYMMDD可选] - 输出当日行情+涨停池信息+资金流向分档（DC）；须 tushare_token
+🔹 股票回测 <代码> <YYYYMMDD-YYYYMMDD> [仅基准|含策略] - ≥2日可看买入持有；默认<40日跳过策略；示例: 股票回测 600519 20240101-20240115 / … 20240630 含策略
 🔹 短线选股 [候选数] [输出条数] [额X亿] [加资金流] [加大盘] [加触发] [剔除关键词…] - |涨跌幅|候选 + 量价因子排序；默认剔北交所/创业板/科创板（可用含*恢复）；「加大盘」拉上证并按档位缩放总分；「加触发」展示威科夫主触发并小额加减分；与「威科夫选股」候选近似但默认打分不同
 🔹 短线批量分析 <代码…> [加资金流] [加大盘] [加触发] [展示条数] - 同源量价因子批量打分；单次最多约40只；展示条数默认20、最大50
 🔹 威科夫选股 [候选数] [输出条数] [额X亿] [剔除关键词…] - 上证盘面水温 + 阶段/触发/量价/均线/赔率/仓位建议（启发式，不含资金流）；默认剔北交所/创业板/科创板（可用含*恢复）；候选规则贴近短线选股；单次拉上证指数一次；有效样本需不少于约52根日K
@@ -4141,7 +4685,7 @@ class FundAnalyzerPlugin(Star):
 💡 并发拉多档 K 线时若频繁断连，多为数据源限流或网络原因，可稍后重试或减少分析数量。
 🔹 量化分析 [代码] [发图|出图|要图|图片] - 绩效/技术/回测（无LLM）；默认文本报告；需图加「发图」等
 🔹 智能分析 [代码] - 🤖AI量化深度分析
-🔹 股票智能分析 [代码] [发图|出图|要图|图片] [详进度…] - ⚖️多智能体博弈；默认仅结论文本；需报告图时加「发图」等；「详进度」输出阶段说明
+🔹 股票智能分析 [代码] [发图|出图|要图|图片] [详进度…] - ⚖️多智能体博弈；结论文本含参考买入/止损价位（演示）；默认仅结论文本；需报告图时加「发图」等；「详进度」输出阶段说明
 🔹 基金历史 [代码] [天数] - 查看历史行情
 🔹 搜索基金 关键词 - 搜索LOF基金
 🔹 设置基金 代码 - 设置默认基金

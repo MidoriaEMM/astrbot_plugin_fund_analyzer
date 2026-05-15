@@ -545,11 +545,18 @@ class DebateEngine:
 
         return ""
 
-    def format_debate_summary(self, result: DebateResult) -> str:
+    def format_debate_summary(
+        self,
+        result: DebateResult,
+        alignment_dict: dict[str, Any] | None = None,
+    ) -> str:
         """
         格式化辩论结果为简洁纯文本摘要（不含任何 markdown）
-        作为图片报告的文字补充，方便快速阅读
+        作为图片报告的文字补充，方便快速阅读。
+
+        alignment_dict: 日 K 对齐指标（ref_close、atr14 等），用于附录价位提示。
         """
+        from .debate_trade_hint import format_trade_levels_lines
         direction_map = {
             "看涨": "📈 看涨",
             "看跌": "📉 看跌",
@@ -590,6 +597,15 @@ class DebateEngine:
         if conclusion:
             lines.append("━━━━━━━━━━━━━━━━━")
             lines.append(conclusion)
+
+        level_lines = format_trade_levels_lines(
+            direction=result.final_direction,
+            latest_price=float(result.stock_price or 0.0),
+            alignment=alignment_dict,
+        )
+        if level_lines:
+            lines.append("━━━━━━━━━━━━━━━━━")
+            lines.extend(level_lines)
 
         lines.append("━━━━━━━━━━━━━━━━━")
         lines.append(

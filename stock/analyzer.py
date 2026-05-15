@@ -291,59 +291,113 @@ class StockAnalyzer:
             ),
         )
 
+    @staticmethod
+    def _code6(stock_code: str) -> str:
+        return stock_code.split(".", 1)[0] if "." in stock_code else stock_code
+
+    def _quote_symbol_candidates(self, stock_code: str) -> list[str]:
+        candidates = [stock_code]
+        try:
+            from ..tickflow_client.symbols import normalize_tickflow_symbol
+
+            norm = normalize_tickflow_symbol(stock_code)
+            if norm not in candidates:
+                candidates.append(norm)
+        except ValueError:
+            pass
+        return candidates
+
+    async def _try_tickflow_realtime(
+        self, stock_code: str, *, fail_log: str | None = None
+    ) -> StockInfo | None:
+        if not self._tickflow_key:
+            return None
+        try:
+            from ..tickflow_client import (
+                fetch_quote_realtime,
+                quote_to_stock_fields,
+            )
+
+            code6 = self._code6(stock_code)
+            for sym in self._quote_symbol_candidates(stock_code):
+                q = await asyncio.to_thread(
+                    fetch_quote_realtime, self._tickflow_key, sym
+                )
+                if isinstance(q, dict) and q:
+                    self._current_source = "tickflow"
+                    return StockInfo(**quote_to_stock_fields(q, code6))
+        except ImportError as e:
+            logger.warning(f"Tickflow 未安装或不可导入，跳过该数据源: {e}")
+        except Exception as e:
+            if fail_log:
+                logger.warning(f"{fail_log}: {e}")
+            else:
+                logger.warning(f"Tickflow 个股行情失败: {e}")
+        return None
+
+    async def _try_tushare_realtime(self, stock_code: str) -> StockInfo | None:
+        if not self._tushare_token:
+            return None
+        try:
+            from ..tushare_client import fetch_quote_realtime, quote_to_stock_fields
+
+            code6 = self._code6(stock_code)
+            for sym in self._quote_symbol_candidates(stock_code):
+                q = await asyncio.to_thread(
+                    fetch_quote_realtime, self._tushare_token, sym
+                )
+                if isinstance(q, dict) and q:
+                    self._current_source = "tushare"
+                    return StockInfo(**quote_to_stock_fields(q, code6))
+        except ImportError as e:
+            logger.warning(f"Tushare 未安装或不可导入，跳过该数据源: {e}")
+        except Exception as e:
+            if self._tickflow_key:
+                logger.warning(f"Tushare 个股行情失败，回退 Tickflow: {e}")
+            else:
+                logger.warning(f"Tushare 个股行情失败，回退 AKShare 全表: {e}")
+        return None
+
     async def get_stock_realtime(self, stock_code: str) -> StockInfo | None:
         """
         获取A股实时行情
 
         Args:
-            stock_code: 股票代码（如 000001、600519）
+            stock_code: 股票代码（如 000001、600519 或 000001.SZ）
 
         Returns:
             StockInfo 对象或 None
         """
-        # 确保股票代码是字符串格式
         stock_code = str(stock_code).strip()
-        logger.debug(f"查询股票代码: '{stock_code}'")
+        code6 = self._code6(stock_code)
+        logger.debug(f"查询股票代码: '{stock_code}' (code6={code6})")
 
-        if self._tickflow_key:
-            try:
-                from ..tickflow_client import (
-                    fetch_quote_realtime,
-                    quote_to_stock_fields,
-                )
-
-                q = await asyncio.to_thread(
-                    fetch_quote_realtime, self._tickflow_key, stock_code
-                )
-                if isinstance(q, dict) and q:
-                    self._current_source = "tickflow"
-                    return StockInfo(**quote_to_stock_fields(q, stock_code))
-            except ImportError as e:
-                logger.warning(f"Tickflow 未安装或不可导入，跳过该数据源: {e}")
-            except Exception as e:
-                logger.warning(f"Tickflow 个股行情失败，尝试 Tushare: {e}")
+        info = await self._try_tickflow_realtime(
+            stock_code,
+            fail_log=(
+                "Tickflow 个股行情失败，尝试 Tushare"
+                if self._tushare_token
+                else None
+            ),
+        )
+        if info is not None:
+            return info
 
         if self._tushare_token:
-            try:
-                from ..tushare_client import fetch_quote_realtime, quote_to_stock_fields
+            info = await self._try_tushare_realtime(stock_code)
+            if info is not None:
+                return info
 
-                q = await asyncio.to_thread(
-                    fetch_quote_realtime, self._tushare_token, stock_code
-                )
-                if isinstance(q, dict) and q:
-                    self._current_source = "tushare"
-                    return StockInfo(**quote_to_stock_fields(q, stock_code))
-            except ImportError as e:
-                logger.warning(f"Tushare 未安装或不可导入，跳过该数据源: {e}")
-            except Exception as e:
-                logger.warning(f"Tushare 个股行情失败，回退 AKShare 全表: {e}")
+        if self._tickflow_key:
+            info = await self._try_tickflow_realtime(stock_code)
+            if info is not None:
+                return info
+            logger.warning("Tickflow 个股行情仍不可用，回退 AKShare 全表")
 
         try:
-            # 获取A股实时行情（使用缓存）
             df = await self._get_stock_data()
 
-            # 查找指定股票
-            stock_data = df[df["代码"] == stock_code]
+            stock_data = df[df["代码"] == code6]
 
             if stock_data.empty:
                 logger.warning(f"未找到股票代码: {stock_code}")

@@ -51,58 +51,19 @@ def _col(lc: dict[str, str], names: tuple[str, ...]) -> Optional[str]:
     return None
 
 
-def fetch_daily_klines_as_eastmoney_history(
-    api_key: str | None,
-    code: str,
-    days: int,
-    adjust: str = "qfq",
-) -> list[dict[str, Any]] | None:
-    """
-    使用 ``ts.pro_bar`` 拉取日 K（含换手率因子 ``tor``），转成与同项目东财
-    ``EastMoneyAPI._get_exchange_fund_history`` 相同的条目结构：
-    ``date, open, close, high, low, volume, amount, change_rate, turnover_rate``。
+def _normalize_yyyymmdd(s: str) -> str:
+    t = (s or "").strip().replace("-", "")[:8]
+    if len(t) != 8 or not t.isdigit():
+        raise ValueError(f"无效日期: {s!r}，请使用 YYYYMMDD")
+    return t
 
-    官方口径下 ``vol`` 为「手」，``amount`` 为「千元」；本条目中的 ``volume`` 已换算为「股」，
-    ``amount`` 已换算为「元」，与同项目场内 K / Tickflow 习惯一致。
-    """
+
+def _dataframe_to_eastmoney_history_rows(raw: Any) -> list[dict[str, Any]] | None:
+    """将 pro_bar DataFrame 转为东财对齐的日 K 列表。"""
     try:
         import pandas as pd
     except ImportError as exc:
         raise ImportError("请安装 pandas") from exc
-
-    ts_code = normalize_tickflow_symbol(str(code).strip())
-    d_need = max(int(days), 1)
-    end_dt = datetime.now()
-    start_dt = end_dt - timedelta(days=d_need * 3 + 90)
-
-    ts_mod, _pro = prepare_sdk(api_key)
-
-    adj = adjust_eastmoney_to_tickflow(adjust)
-    pb_kw: dict[str, Any] = {
-        "ts_code": ts_code,
-        "asset": "E",
-        "freq": "D",
-        "start_date": start_dt.strftime("%Y%m%d"),
-        "end_date": end_dt.strftime("%Y%m%d"),
-        "factors": ["tor"],
-    }
-    if adj is not None:
-        pb_kw["adj"] = adj
-
-    try:
-        raw = ts_mod.pro_bar(**pb_kw)
-    except Exception:
-        raw = None
-
-    if raw is None or not isinstance(raw, pd.DataFrame) or len(raw) == 0:
-        pb_fallback = dict(pb_kw)
-        pb_fallback.pop("factors", None)
-        try:
-            raw_fb = ts_mod.pro_bar(**pb_fallback)
-        except Exception:
-            raw_fb = None
-        if raw_fb is not None and isinstance(raw_fb, pd.DataFrame) and len(raw_fb) > 0:
-            raw = raw_fb
 
     if raw is None or not isinstance(raw, pd.DataFrame) or len(raw) == 0:
         return None
@@ -128,27 +89,22 @@ def fetch_daily_klines_as_eastmoney_history(
     rows: list[dict[str, Any]] = []
     for _, row in dd.iterrows():
         date_s = str(row[dc])[:10].replace("/", "-")
-
         clo = _safe_float(row[cl])
-
         pct_chg = _safe_float(row[pct]) if pct else float("nan")
-        if pct_chg == pct_chg:  # non-NaN
+        if pct_chg == pct_chg:
             change_rate = round(float(pct_chg), 4)
         elif prev_close is not None and prev_close > 0:
             change_rate = round((clo - prev_close) / prev_close * 100, 4)
         else:
             change_rate = 0.0
-
         vol_hand = _safe_float(row[vo]) if vo else 0.0
         amt_kilo = _safe_float(row[am]) if am else 0.0
-
         turnover_rate = 0.0
         if tr and tr in row.index:
             t_raw = row[tr]
             turnover_rate = _safe_float(t_raw)
             if 0 < abs(turnover_rate) < 1:
                 turnover_rate *= 100.0
-
         rows.append(
             {
                 "date": date_s,
@@ -163,7 +119,108 @@ def fetch_daily_klines_as_eastmoney_history(
             }
         )
         prev_close = clo
+    return rows if rows else None
 
+
+def _fetch_pro_bar(
+    api_key: str | None,
+    ts_code: str,
+    start_yyyymmdd: str,
+    end_yyyymmdd: str,
+    adjust: str,
+) -> list[dict[str, Any]] | None:
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise ImportError("请安装 pandas") from exc
+
+    ts_mod, _pro = prepare_sdk(api_key)
+    adj = adjust_eastmoney_to_tickflow(adjust)
+    pb_kw: dict[str, Any] = {
+        "ts_code": ts_code,
+        "asset": "E",
+        "freq": "D",
+        "start_date": start_yyyymmdd,
+        "end_date": end_yyyymmdd,
+        "factors": ["tor"],
+    }
+    if adj is not None:
+        pb_kw["adj"] = adj
+    try:
+        raw = ts_mod.pro_bar(**pb_kw)
+    except Exception:
+        raw = None
+    if raw is None or not isinstance(raw, pd.DataFrame) or len(raw) == 0:
+        pb_fallback = dict(pb_kw)
+        pb_fallback.pop("factors", None)
+        try:
+            raw_fb = ts_mod.pro_bar(**pb_fallback)
+        except Exception:
+            raw_fb = None
+        if raw_fb is not None and isinstance(raw_fb, pd.DataFrame) and len(raw_fb) > 0:
+            raw = raw_fb
+    return _dataframe_to_eastmoney_history_rows(raw)
+
+
+def fetch_daily_klines_date_range(
+    api_key: str | None,
+    code: str,
+    start_yyyymmdd: str,
+    end_yyyymmdd: str,
+    adjust: str = "qfq",
+    *,
+    min_bars: int = 2,
+) -> list[dict[str, Any]] | None:
+    """按起止日期拉取日 K，条目结构与东财场内 K 一致。"""
+    start = _normalize_yyyymmdd(start_yyyymmdd)
+    end = _normalize_yyyymmdd(end_yyyymmdd)
+    if start > end:
+        raise ValueError(f"开始日期不能晚于结束日期: {start} > {end}")
+
+    ts_code = normalize_tickflow_symbol(str(code).strip())
+    rows = _fetch_pro_bar(api_key, ts_code, start, end, adjust)
+    if not rows:
+        return None
+
+    def _date_key(d: str) -> str:
+        return str(d).replace("-", "")[:8]
+
+    filtered = [r for r in rows if start <= _date_key(r.get("date", "")) <= end]
+    if len(filtered) < min_bars:
+        return None
+    return filtered
+
+
+def fetch_daily_klines_as_eastmoney_history(
+    api_key: str | None,
+    code: str,
+    days: int,
+    adjust: str = "qfq",
+) -> list[dict[str, Any]] | None:
+    """
+    使用 ``ts.pro_bar`` 拉取日 K（含换手率因子 ``tor``），转成与同项目东财
+    ``EastMoneyAPI._get_exchange_fund_history`` 相同的条目结构：
+    ``date, open, close, high, low, volume, amount, change_rate, turnover_rate``。
+
+    官方口径下 ``vol`` 为「手」，``amount`` 为「千元」；本条目中的 ``volume`` 已换算为「股」，
+    ``amount`` 已换算为「元」，与同项目场内 K / Tickflow 习惯一致。
+    """
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise ImportError("请安装 pandas") from exc
+
+    ts_code = normalize_tickflow_symbol(str(code).strip())
+    d_need = max(int(days), 1)
+    end_dt = datetime.now()
+    start_dt = end_dt - timedelta(days=d_need * 3 + 90)
+    rows = _fetch_pro_bar(
+        api_key,
+        ts_code,
+        start_dt.strftime("%Y%m%d"),
+        end_dt.strftime("%Y%m%d"),
+        adjust,
+    )
     if not rows:
         return None
 

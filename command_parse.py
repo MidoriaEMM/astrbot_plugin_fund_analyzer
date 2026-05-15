@@ -30,6 +30,8 @@ EXCLUDE_STAR_KEYWORDS = frozenset({"去科技", "去科创板", "去科创"})
 INCLUDE_STAR_KEYWORDS = frozenset({"含科技", "含科创板", "含科创"})
 # 仅「量化精选股票」使用 exclude_limit_up
 EXCLUDE_LIMIT_UP_KEYWORDS = frozenset({"去涨停", "剔涨停", "剔除涨停"})
+# 「量化精选股票多空 / 仓位计划」：写上则涨停标的仍跑多智能体辩论；默认不写则涨停跳过 LLM
+LIMIT_UP_DEBATE_KEYWORDS = frozenset({"涨停分析"})
 # 显式保留 ST；未写时默认剔除 *ST/ST（见 _pairs_for_short_term 等）
 INCLUDE_ST_KEYWORDS = frozenset({"含ST", "带ST", "不去ST", "保留ST"})
 
@@ -316,15 +318,21 @@ def parse_quant_stock_screen_debate_tail(
     default_max_scan: int = DEFAULT_QUANT_STOCK_MAX_SCAN,
     default_top: int = DEFAULT_QUANT_STOCK_TOP,
     max_debate_cap: int = MAX_QUANT_STOCK_DEBATE_CAP,
-) -> tuple[int, int, int, bool, bool, bool, bool, bool]:
+) -> tuple[int, int, int, bool, bool, bool, bool, bool, bool]:
     """
     解析「量化精选股票多空」尾部：与「量化精选股票」相同的板块/涨停/ST 关键词与默认（默认剔北交所、创业板、科创板）。
+    可选写「涨停分析」：涨停标的亦执行多智能体辩论；默认不写则涨停跳过 LLM。
     正整数可 1～3 个：依次为 max_scan、top_n、智能分析只数上限；
     第三个上限会与 top_n 及 max_debate_cap 取最小值；未写第三个时分析只数为 min(top_n, max_debate_cap)。
     """
+    raw_parts = (tail or "").split()
+    debate_on_limit_up = any(p in LIMIT_UP_DEBATE_KEYWORDS for p in raw_parts)
+    filtered = [p for p in raw_parts if p not in LIMIT_UP_DEBATE_KEYWORDS]
+    tail_wo_debate_kw = " ".join(filtered)
+
     rest, exclude_bse, exclude_chinext, exclude_limit_up, exclude_star, include_st = (
         split_exchange_exclude_keyword_tokens(
-            tail,
+            tail_wo_debate_kw,
             default_exclude_bse=True,
             default_exclude_chinext=True,
             default_exclude_star=True,
@@ -358,6 +366,7 @@ def parse_quant_stock_screen_debate_tail(
             exclude_limit_up,
             exclude_star,
             exclude_st,
+            debate_on_limit_up,
         )
     debate_cap = min(top_n, max_debate_cap)
     return (
@@ -369,6 +378,7 @@ def parse_quant_stock_screen_debate_tail(
         exclude_limit_up,
         exclude_star,
         exclude_st,
+        debate_on_limit_up,
     )
 
 
@@ -478,6 +488,7 @@ def parse_quant_stock_screen_position_tail(
     bool,
     bool,
     bool,
+    bool,
     float | None,
     float,
     float,
@@ -489,6 +500,7 @@ def parse_quant_stock_screen_position_tail(
     """
     解析「量化精选仓位计划」尾部：在「量化精选股票多空」筛参基础上（默认剔除北交所、创业板、科创板），
     增加本金 / 风险 / 止损ATR / 最低分 / 额均 / 单票上限 / 最多只数（均可选除本金外有默认值）。
+    「涨停分析」等辩论开关与多空指令相同。
     本金须出现一次：本金100万、本金50w、本金1000000。
     """
     parts = (tail or "").split()
@@ -542,6 +554,7 @@ def parse_quant_stock_screen_position_tail(
         exclude_limit_up,
         exclude_star,
         exclude_st,
+        debate_on_limit_up,
     ) = parse_quant_stock_screen_debate_tail(
         debate_rest,
         default_max_scan=default_max_scan,
@@ -557,6 +570,7 @@ def parse_quant_stock_screen_position_tail(
         exclude_limit_up,
         exclude_star,
         exclude_st,
+        debate_on_limit_up,
         principal,
         risk_fraction,
         k_atr,
@@ -795,3 +809,263 @@ def parse_short_term_batch_tail(
         with_market_regime,
         with_wyckoff_trigger,
     )
+
+
+# 「打板选股」：Tushare 涨停池 + 评分引擎（建议 8000 积分档）
+DABAN_NO_THS_KEYWORDS = frozenset({"不含同花顺", "无同花顺"})
+DABAN_NO_STEP_KEYWORDS = frozenset({"不含天梯", "无天梯"})
+DABAN_NO_LHB_KEYWORDS = frozenset({"不含龙虎榜", "无龙虎榜"})
+DABAN_EXCLUDE_BJ_KEYWORDS = frozenset({"去北交所", "剔除北交所"})
+DABAN_MODE_KEYWORDS = frozenset({"综合", "首板", "接力", "龙头"})
+_DABAN_MODE_MAP = {
+    "综合": "mixed",
+    "首板": "shouban",
+    "接力": "relay",
+    "龙头": "dragon",
+}
+DEFAULT_DABAN_TOP_N = 15
+MIN_DABAN_TOP_N = 1
+MAX_DABAN_TOP_N = 200
+
+
+def parse_daban_pick_tail(
+    tail: str,
+) -> tuple[str | None, int, str, bool, bool, bool, bool, bool]:
+    """
+    解析「打板选股」尾部。
+
+    Returns:
+        (trade_date, top_n, mode_str, want_ths, want_step, want_top_list,
+         exclude_bj, exclude_st)
+        mode_str: mixed | shouban | relay | dragon
+    """
+    parts = (tail or "").split()
+    trade_date: str | None = None
+    top_n = DEFAULT_DABAN_TOP_N
+    mode = "mixed"
+    want_ths = True
+    want_step = True
+    want_top_list = True
+    exclude_bj = False
+    exclude_st = True
+    for p in parts:
+        if p in DABAN_NO_THS_KEYWORDS:
+            want_ths = False
+        elif p in DABAN_NO_STEP_KEYWORDS:
+            want_step = False
+        elif p in DABAN_NO_LHB_KEYWORDS:
+            want_top_list = False
+        elif p in DABAN_EXCLUDE_BJ_KEYWORDS:
+            exclude_bj = True
+        elif p in INCLUDE_ST_KEYWORDS:
+            exclude_st = False
+        elif p in DABAN_MODE_KEYWORDS:
+            mode = _DABAN_MODE_MAP.get(p, mode)
+        elif len(p) == 8 and p.isdigit():
+            trade_date = p
+        elif p.isdigit() and len(p) <= 3:
+            try:
+                v = int(p)
+                if v > 0:
+                    top_n = v
+            except ValueError:
+                pass
+    top_n = max(MIN_DABAN_TOP_N, min(MAX_DABAN_TOP_N, top_n))
+    return (
+        trade_date,
+        top_n,
+        mode,
+        want_ths,
+        want_step,
+        want_top_list,
+        exclude_bj,
+        exclude_st,
+    )
+
+
+def parse_daban_money_tail(
+    tail: str,
+) -> tuple[str | None, int, bool, bool, bool, bool]:
+    """兼容旧调用：等同 parse_daban_pick_tail（忽略 mode）。"""
+    (
+        trade_date,
+        top_n,
+        _mode,
+        want_ths,
+        want_step,
+        want_top_list,
+        exclude_bj,
+        _exclude_st,
+    ) = parse_daban_pick_tail(tail)
+    return trade_date, top_n, want_ths, want_step, want_top_list, exclude_bj
+
+
+def parse_daban_pick_debate_tail(
+    tail: str,
+    *,
+    max_debate_cap: int = MAX_QUANT_STOCK_DEBATE_CAP,
+) -> tuple[str | None, int, int, str, bool, bool, bool, bool, bool]:
+    """
+    解析「打板选股多空」尾部：打板选股参数 + 辩论只数。
+    正整数 1～2 个：top_n、辩论只数（未写第二项则 min(top_n, max_debate_cap)）。
+    """
+    parts = (tail or "").split()
+    trade_date: str | None = None
+    mode = "mixed"
+    want_ths = True
+    want_step = True
+    want_top_list = True
+    exclude_bj = False
+    exclude_st = True
+    nums: list[int] = []
+    for p in parts:
+        if p in DABAN_NO_THS_KEYWORDS:
+            want_ths = False
+        elif p in DABAN_NO_STEP_KEYWORDS:
+            want_step = False
+        elif p in DABAN_NO_LHB_KEYWORDS:
+            want_top_list = False
+        elif p in DABAN_EXCLUDE_BJ_KEYWORDS:
+            exclude_bj = True
+        elif p in INCLUDE_ST_KEYWORDS:
+            exclude_st = False
+        elif p in DABAN_MODE_KEYWORDS:
+            mode = _DABAN_MODE_MAP.get(p, mode)
+        elif len(p) == 8 and p.isdigit():
+            trade_date = p
+        elif p.isdigit() and len(p) < 8:
+            try:
+                v = int(p)
+                if v > 0:
+                    nums.append(v)
+            except ValueError:
+                pass
+    if len(nums) == 0:
+        top_n = DEFAULT_DABAN_TOP_N
+        debate_cap = min(top_n, max_debate_cap)
+    elif len(nums) == 1:
+        top_n = nums[0]
+        debate_cap = min(top_n, max_debate_cap)
+    else:
+        top_n = nums[0]
+        debate_cap = min(nums[1], nums[0], max_debate_cap)
+    top_n = max(MIN_DABAN_TOP_N, min(MAX_DABAN_TOP_N, top_n))
+    debate_cap = max(1, min(debate_cap, top_n, max_debate_cap))
+    return (
+        trade_date,
+        top_n,
+        debate_cap,
+        mode,
+        want_ths,
+        want_step,
+        want_top_list,
+        exclude_bj,
+        exclude_st,
+    )
+
+
+def parse_date_range_token(token: str) -> tuple[str, str]:
+    """
+    解析 ``YYYYMMDD-YYYYMMDD`` 日期区间。
+
+    Returns:
+        (start_yyyymmdd, end_yyyymmdd)
+    """
+    s = (token or "").strip()
+    if "-" not in s:
+        raise ValueError(
+            f"日期区间格式错误: {token!r}，请使用 YYYYMMDD-YYYYMMDD，例如 20240101-20240630"
+        )
+    a, b = s.split("-", 1)
+    start = a.strip().replace("-", "")[:8]
+    end = b.strip().replace("-", "")[:8]
+    if len(start) != 8 or not start.isdigit():
+        raise ValueError(f"开始日期无效: {a!r}")
+    if len(end) != 8 or not end.isdigit():
+        raise ValueError(f"结束日期无效: {b!r}")
+    if start > end:
+        raise ValueError(f"开始日期不能晚于结束日期: {start} > {end}")
+    return start, end
+
+
+STOCK_BACKTEST_STRATEGY_OFF_KEYWORDS = frozenset(
+    {"仅基准", "买入持有", "不含策略"}
+)
+STOCK_BACKTEST_STRATEGY_ON_KEYWORDS = frozenset({"含策略", "全策略"})
+
+
+def parse_stock_backtest_tail(tail: str) -> tuple[str, str, str, str]:
+    """
+    解析「股票回测」尾部。
+
+    用法: 股票回测 <代码> <YYYYMMDD-YYYYMMDD> [仅基准|含策略]
+
+    Returns:
+        (code_raw, start_yyyymmdd, end_yyyymmdd, strategy_mode)
+        strategy_mode: auto | off | on（仅基准与含策略同写时含策略优先）
+    """
+    parts = (tail or "").split()
+    if len(parts) < 2:
+        raise ValueError(
+            "用法: 股票回测 <代码> <YYYYMMDD-YYYYMMDD> [仅基准|含策略]\n"
+            "示例: 股票回测 600519 20240101-20240630\n"
+            "      股票回测 600519 20240101-20240115 仅基准"
+        )
+    code = parts[0]
+    if len(parts) >= 3 and len(parts[1]) == 8 and parts[1].isdigit() and len(parts[2]) == 8:
+        raise ValueError(
+            "请使用 YYYYMMDD-YYYYMMDD 格式合并日期区间，"
+            "例如: 股票回测 600519 20240101-20240630"
+        )
+    start, end = parse_date_range_token(parts[1])
+
+    want_off = False
+    want_on = False
+    for p in parts[2:]:
+        if p in STOCK_BACKTEST_STRATEGY_ON_KEYWORDS:
+            want_on = True
+        elif p in STOCK_BACKTEST_STRATEGY_OFF_KEYWORDS:
+            want_off = True
+
+    if want_on:
+        strategy_mode = "on"
+    elif want_off:
+        strategy_mode = "off"
+    else:
+        strategy_mode = "auto"
+
+    return code, start, end, strategy_mode
+
+
+def ts_code_to_fund_debate_code(ts_code: str) -> str:
+    """Tushare ts_code → 六位证券代码，供 get_lof_realtime / 辩论 pipeline。"""
+    import re
+
+    s = str(ts_code or "").strip().upper()
+    if "." in s:
+        s = s.split(".", 1)[0]
+    d = re.sub(r"\D", "", s)
+    if not d:
+        return ""
+    if len(d) > 6:
+        d = d[-6:]
+    return d.zfill(6)
+
+
+def parse_daban_check_stock_tail(tail: str) -> tuple[str | None, str]:
+    """
+    解析「打板查股」尾部。
+
+    用法: 打板查股 <代码或ts_code> [YYYYMMDD]
+    Returns:
+        (trade_date_or_none, code_raw)
+    """
+    parts = (tail or "").split()
+    if not parts:
+        return None, ""
+    trade_date: str | None = None
+    code = parts[0].strip()
+    for p in parts[1:]:
+        if len(p) == 8 and p.isdigit():
+            trade_date = p
+    return trade_date, code
